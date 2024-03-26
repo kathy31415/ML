@@ -1,0 +1,417 @@
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data")
+```
+
+```{r pkg load}
+#Load required packages
+suppressWarnings(requiredpackages <- c("readxl", "stringr", "tidyverse", "ggplot2", "dplyr", "digest", "xgboost", "zoo", "vtreat", "magrittr", "rapport"))
+
+install_load <- function(packages){
+     for (p in packages) {
+          if (p %in% rownames(installed.packages())) {
+               library(p, character.only=TRUE)
+          } else {
+               install.packages(p)
+               library(p,character.only = TRUE)
+          }
+     }
+}
+
+suppressWarnings(install_load(requiredpackages))
+rm(requiredpackages)
+```
+
+```{r}
+# Import data
+# starting from 28-Aug-19 as too many missing ida1 prices and vols until this date
+# ending last day of aug-23
+suppressWarnings(data <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/All Data - DAM & IDA1- Imputed.xlsx", sheet=2, col_names = TRUE)[2785:73104,c(2,4,6:12,16:18,22,23)])
+tail(data)
+
+# price ida1 stays in because this is the outcome variable
+colnames(data) <- c('Year', 'Month', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'Gas', 'PriceIDA1', 'VolIDA1', 'HH', 'ForecastWind')
+
+# remove volume ida1 because we will not know what this is prior to the market closing
+data <- data[, c('Year', 'Month', 'DOM', 'HH', 'PriceDAM', 'VolDAM', 'DOY', 'DOW', 'WOY', 'Quarter', 'Gas', 'ForecastWind', 'PriceIDA1')]
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ does DAM Vol need to be split across the two half hours? ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+
+```{r}
+#imputation & cleaning
+
+# Median imputation for DAPrice column
+missing <- data[data$PriceDAM == 0,]
+missingna <- data[is.na(data$PriceDAM) == TRUE,]
+missing_rows <- data$PriceDAM == 0
+data$PriceDAM[missing_rows] <- median(data$PriceDAM, na.rm = TRUE)
+missingPrice <- data[data$PriceDAM == 0,] # should revert to zero if successful
+
+# Median imputation for DAVolume column
+missing <- data[data$VolDAM == 0,]
+missingna <- data[is.na(data$VolDAM) == TRUE,]
+missing_rows <- data$VolDAM == 0
+data$VolDAM[missing_rows] <- median(data$VolDAM, na.rm = TRUE)
+missingVol <- data[data$VolDAM == 0,] # should revert to zero if successful
+
+# Median imputation for IDA1Price column
+missing <- data[data$PriceIDA1 == 0,]
+missingna <- data[is.na(data$PriceIDA1) == TRUE,]
+data[is.na(data$PriceIDA1) == TRUE,] <- 0
+missing_rows <- data$PriceIDA1 == 0
+data$PriceIDA1[missing_rows] <- median(data$PriceIDA1, na.rm = TRUE)
+missingPrice1 <- data[data$PriceIDA1 == 0,] # should revert to zero if successful
+
+# Impute missing forecast wind values
+missing <- data[data$ForecastWind == 0,]
+missing_rows <- is.na(data$ForecastWind) == TRUE
+data$ForecastWind[missing_rows] <- median(data$ForecastWind, na.rm = TRUE)
+missing_rows <- is.na(data$ForecastWind) == TRUE
+missingWind <- sum(missing_rows == TRUE) # should equal zero if successful
+
+# Find rows with missing values (NA)
+rows_with_missing <- which(rowSums(is.na(data)) > 0)
+if (rapportools::is.empty(rows_with_missing) != TRUE) {
+  data <- data[1:((nrow(data))-((length(rows_with_missing))+1)),] #remove rows w missing data
+}
+rm(list = grep("*missing*", ls(), value = TRUE))
+```
+
+```{r Tech Ind functions}
+#Create technical indicator functions
+
+#Price momentum MOM
+mymom <- function(price, n) {
+  mom <- rep(0, length(price))
+  N <- length(price)
+  for (i in (n + 1):(N-n)) {
+    mom[i] <- price[i] - price[i - n]
+  }
+  return(mom)
+}
+
+#Percentage Range PR
+mypr <- function (price,n){
+  pr <- c()
+  pr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- ((max(price[(i-n):i])))
+    min.temp <- ((min(price[(i-n):i])))
+    price.temp <- price[i]
+    numerator <- max.temp - price.temp
+    denominator <- max.temp - min.temp
+    pr[i] <- 100 * (numerator / denominator)
+  }
+  return(pr)
+}
+
+#Absolute True Range ATR
+myatr <- function (price,n){
+  atr <- c()
+  tr <- c()
+  atr[1:(n-1)] <- NA
+  tr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- max(price[(i-n+1):i])
+    min.temp <- min(price[(i-n+1):i])
+    price.temp <- price[i]
+    A.temp <- max.temp - min.temp
+    B.temp <- abs(max.temp - price.temp)
+    C.temp <- abs(min.temp - price.temp)
+    TR.temp <- max(c(A.temp, B.temp, C.temp))
+    tr[i] <- TR.temp
+    atr[i] <- sum(tr[(i-n+1):i])
+  }
+  return(atr)
+}
+
+#Average Directional Movement Index ADX
+myadx <- function(price, n) {
+  adx <- numeric(length(price))
+  priceup <- numeric(length(price))
+  pricedown <- numeric(length(price))
+  adx[1:(n-1)] <- NA
+  priceup[1:(n-1)] <- NA
+  pricedown[1:(n-1)] <- NA
+  for (i in n:length(price)) {
+    if (!is.na(price[i]) && !is.na(price[(i-n+1)]) && price[i] - price[(i-n+1)] > 0) {
+      priceup[i] <- price[i] - price[(i-n+1)]
+    } else {
+      pricedown[i] <- price[i] - price[(i-n+1)]
+    }
+    positiveDM <- sum(priceup[(i-n+1):i], na.rm = TRUE)
+    negativeDM <- -sum(pricedown[(i-n+1):i], na.rm = TRUE)
+    tr <- sum(abs(diff(price[(i-n+1):(i+1)])), na.rm = TRUE)
+    plusDI <- (positiveDM / tr) * 100
+    minusDI <- (negativeDM / tr) * 100
+    adx[i] <- (abs(plusDI - minusDI) / (plusDI + minusDI)) * 100
+  }
+  return(adx)
+}
+
+#Relative Strength index RSI
+calculate_RSIs <- function(price, s) {
+  n <- length(price)
+  up <- numeric(n)
+  down <- numeric(n)
+  up[1] <- 0
+  down[1] <- 0
+  
+  for (i in 2:n) {
+    diff_price <- price[i] - price[i - 1]
+    if (!is.na(diff_price) && diff_price > 0) {
+      up[i] <- diff_price
+      down[i] <- 0
+    } else if (!is.na(diff_price) && diff_price < 0) {
+      up[i] <- 0
+      down[i] <- abs(diff_price)
+    } else {
+      up[i] <- 0
+      down[i] <- 0
+    }
+  }
+  
+  avg_up <- rollapply(up, width = s, FUN = mean, align = "right", fill = NA)
+  avg_down <- rollapply(down, width = s, FUN = mean, align = "right", fill = NA)
+  
+  RS <- avg_up / avg_down
+  RSI <- 100 - (100 / (1 + RS))
+  
+  return(as.vector(as.numeric(RSI)))
+}
+
+#Mean Absolute Convergence/Divergence MACD
+calculate_MACD <- function(price, a, b) {
+  ma_a <- stats::filter(price, rep(1/a, a), sides = 1)
+  ma_b <- stats::filter(price, rep(1/b, b), sides = 1)
+  macd <- ma_a - ma_b
+  
+  return(as.numeric(macd))
+}
+```
+
+```{r add TIs to df}
+# Add tech indicators to data frame
+data$MACD <- data$PriceDAM %>% calculate_MACD(12, 24)
+data$RSI <- data$PriceDAM %>% calculate_RSIs(24)
+data$ADX <- data$PriceDAM %>% myadx(24)
+data$ATR <- data$PriceDAM %>% myatr(24)
+data$MOM <- data$PriceDAM %>% mymom(24)
+data$PR <- data$PriceDAM %>% mypr(24)
+```
+
+```{r remove missing values from TIs}
+#data cleaning
+
+# Remove rows without TI values from xgb - these will be the beginning rows therefore the integrity of TS data remains intact
+data <- na.omit(data)
+
+# Check if succeeded
+rows_with_missing <- which(rowSums(is.na(data)) > 0)
+df <- data[rows_with_missing,]
+if (nrow(df) == 0) {
+  rm(df, rows_with_missing)
+} else {
+  print("missing values still present")
+}
+```
+
+```{r separate into test and train datasets}
+#data prep into training and testing sets
+k <- round(nrow(data)*0.7)
+data.train <- data[1:k,]
+data.test <- anti_join(data, data.train)
+
+#sanity check
+nrow(data.train) + nrow(data.test) == nrow(data)
+
+#remove outcome vars from test dataset
+data.test <- select(data.test, -c(PriceIDA1))
+```
+
+```{r}
+#extract variable names without outcome var
+vars <- colnames(data.test)
+
+#labels for xgb
+labels <- data$PriceIDA1
+
+#use vtreat to design variable 'treatments' with no outcome variable
+train <- designTreatmentsZ(data.train, vars)
+newvars <-  train$scoreFrame %>%
+  filter(code %in% c("clean", "lev")) %>%
+  use_series(varName)
+
+#prepare data with reqd vars
+data.train <- prepare(train, data.train, varRestriction = newvars)
+
+```
+
+```{r cross val model}
+#XGBOOST MODEL - CV for overfit prevention
+
+#set seed for reproducibility
+set.seed(8787)
+
+cv <- xgb.cv(data = as.matrix(data.train), 
+            label = labels[1:nrow(data.train)],
+            nrounds = 10000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 3,
+            early_stopping_rounds = 5,
+            verbose = TRUE, #can change to false when happy with model tuning
+            print_every_n = 100)
+
+#error logs
+elog <- cv$evaluation_log
+
+#out of sample error
+nrounds <- which.min(elog$test_rmse_mean)
+```
+
+```{r}
+#xgb on train data with best nrounds to get final model
+model <- xgboost(data = as.matrix(data.train), 
+                 label = labels[1:nrow(data.train)],
+                 nrounds = nrounds,
+                 objective = "reg:squarederror",
+                 eta = 0.1,
+                 max_depth = 3,
+                 verbose = FALSE)
+
+importance <- xgb.importance(
+  feature_names <- newvars, model = model
+)
+
+xgb.ggplot.importance(importance_matrix = importance)
+round(importance$Importance*100,2)
+```
+# Do I need to predict volume of IDA1?
+
+```{r}
+#predict with model
+data.test <- prepare(train, data.test, varRestriction = newvars)
+data.test$pred <- predict(model, as.matrix(data.test))
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.train)+1):nrow(data)], "Predicted" = data.test$pred, "Date" = paste0(data.test$DOM," ",data.test$Month," ",data.test$Year," ",data.test$Hour))
+write.csv(outcomes, "IDA1 Model v1.csv")
+```
+
+
+```{r 1st week of sept}
+#use model to predict the first week of september
+
+#use same data.train
+
+#get new data.test (the predictor variables for first week of sept without the IDA1 price or vol)
+suppressWarnings(sep1to7ida1 <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/TestEnv/Sep23 on IDA1.xlsx", col_names = TRUE)[1:336,c(2,4,6:12,16:18,22,23)])
+colnames(sep1to7ida1) <- c('Year', 'Month', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'Gas', 'PriceIDA1', 'VolIDA1', 'HH', 'ForecastWind')
+vars <- c('Year', 'Date', 'Month', 'Hour', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'ForecastWind', 'Gas')
+
+glimpse(sep1to7ida1)
+
+newdata <- sep1to7ida1 %>% select(-c(PriceIDA1))
+#if using xgb: newdata <- xgb.DMatrix(data = data.matrix(newdata), label = (newdata$Gas))
+#glimpse(newdata)
+
+data.test <- prepare(train, newdata, varRestriction = newvars)
+data.test$pred <- predict(model, as.matrix(data.test))
+
+outcomes <- cbind("Actual" = sep1to7ida1$PriceIDA1, "Predicted" = data.test$pred, "Date" = paste0(sep1to7ida1$DOM," ",data.test$Month," ",data.test$Year), Hour = data.test$Hour)
+write.csv(outcomes, "Sep1to7IDA1.csv")
+```
+
+```{r 2nd week of sept}
+#use model to predict the second week of september
+
+#use same data.train
+
+#get new data.test (the predictor variables for 2nd week of sept without the IDA1 price or vol)
+suppressWarnings(sep8to14ida1 <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/TestEnv/Sep23 on IDA1.xlsx", col_names = TRUE)[337:672,c(2,4,6:12,16:18,22,23)])
+colnames(sep8to14ida1) <- c('Year', 'Month', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'Gas', 'PriceIDA1', 'VolIDA1', 'HH', 'ForecastWind')
+vars <- c('Year', 'Date', 'Month', 'Hour', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'ForecastWind', 'Gas')
+
+glimpse(sep8to14ida1)
+
+newdata <- sep8to14ida1 %>% select(-c(PriceIDA1))
+#if using xgb: newdata <- xgb.DMatrix(data = data.matrix(newdata), label = (newdata$Gas))
+#glimpse(newdata)
+
+data.test <- prepare(train, newdata, varRestriction = newvars)
+data.test$pred <- predict(model, as.matrix(data.test))
+
+outcomes <- cbind("Actual" = sep8to14ida1$PriceIDA1, "Predicted" = data.test$pred, "Date" = paste0(sep8to14ida1$DOM," ",data.test$Month," ",data.test$Year), Hour = data.test$Hour)
+write.csv(outcomes, "Sep8to14ida1.csv")
+```
+
+```{r 3rd week of sept}
+#use model to predict the third week of september
+
+#use same data.train
+
+#get new data.test (the predictor variables for 3rd week of sept without the IDA1 price or vol)
+suppressWarnings(sep15to21ida1 <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/TestEnv/Sep23 on IDA1.xlsx", col_names = TRUE)[673:1008,c(2,4,6:12,16:18,22,23)])
+colnames(sep15to21ida1) <- c('Year', 'Month', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'Gas', 'PriceIDA1', 'VolIDA1', 'HH', 'ForecastWind')
+vars <- c('Year', 'Date', 'Month', 'Hour', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'ForecastWind', 'Gas')
+
+glimpse(sep15to21ida1)
+
+newdata <- sep15to21ida1 %>% select(-c(PriceIDA1))
+#if using xgb: newdata <- xgb.DMatrix(data = data.matrix(newdata), label = (newdata$Gas))
+#glimpse(newdata)
+
+data.test <- prepare(train, newdata, varRestriction = newvars)
+data.test$pred <- predict(model, as.matrix(data.test))
+
+outcomes <- cbind("Actual" = sep15to21ida1$PriceIDA1, "Predicted" = data.test$pred, "Date" = paste0(sep15to21ida1$DOM," ",data.test$Month," ",data.test$Year), Hour = data.test$Hour)
+write.csv(outcomes, "sep15to21ida1.csv")
+```
+
+```{r 4th week of sept}
+#use model to predict the 4th week of september
+
+#use same data.train
+
+#get new data.test (the predictor variables for 4th week of sept without the IDA1 price or vol)
+suppressWarnings(sep22to28ida1 <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/TestEnv/Sep23 on IDA1.xlsx", col_names = TRUE)[1009:1344,c(2,4,6:12,16:18,22,23)])
+colnames(sep22to28ida1) <- c('Year', 'Month', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'Gas', 'PriceIDA1', 'VolIDA1', 'HH', 'ForecastWind')
+vars <- c('Year', 'Date', 'Month', 'Hour', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'ForecastWind', 'Gas')
+
+glimpse(sep22to28ida1)
+sep22to28ida1
+newdata <- sep22to28ida1 %>% select(-c(PriceIDA1))
+#if using xgb: newdata <- xgb.DMatrix(data = data.matrix(newdata), label = (newdata$Gas))
+#glimpse(newdata)
+
+data.test <- prepare(train, newdata, varRestriction = newvars)
+data.test$pred <- predict(model, as.matrix(data.test))
+
+outcomes <- cbind("Actual" = sep22to28ida1$PriceIDA1, "Predicted" = data.test$pred, "Date" = paste0(sep22to28ida1$DOM," ",data.test$Month," ",data.test$Year), Hour = data.test$Hour)
+write.csv(outcomes, "sep22to28ida1.csv")
+```
+
+```{r 5th week}
+#use model to predict the 29th september - 5th oct
+
+#use same data.train
+
+#get new data.test (the predictor variables for 4th week of sept without the IDA1 price or vol)
+suppressWarnings(sep29tooct05ida1 <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/TestEnv/Sep23 on IDA1.xlsx", col_names = TRUE)[1345:1680,c(2,4,6:12,16:18,22,23)])
+colnames(sep29tooct05ida1) <- c('Year', 'Month', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'Gas', 'PriceIDA1', 'VolIDA1', 'HH', 'ForecastWind')
+vars <- c('Year', 'Date', 'Month', 'Hour', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'ForecastWind', 'Gas')
+
+glimpse(sep29tooct05ida1)
+
+newdata <- sep29tooct05ida1 %>% select(-c(PriceIDA1))
+#if using xgb: newdata <- xgb.DMatrix(data = data.matrix(newdata), label = (newdata$Gas))
+#glimpse(newdata)
+
+data.test <- prepare(train, newdata, varRestriction = newvars)
+data.test$pred <- predict(model, as.matrix(data.test))
+
+outcomes <- cbind("Actual" = sep29tooct05ida1$PriceIDA1, "Predicted" = data.test$pred, "Date" = paste0(sep29tooct05ida1$DOM," ",data.test$Month," ",data.test$Year), Hour = data.test$Hour)
+write.csv(outcomes, "sep29tooct05ida1.csv")
+```

@@ -1,0 +1,449 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r pkgs}
+
+requiredpackages <- c("creditmodel", "caret", "corrplot", "data.table", "digest", "dplyr", "ggplot2", "gridExtra", "Hmisc", "magrittr", "plyr", "psych", "rapport", "readxl", "stringr", "tidyverse", "TTR", "vtreat", "xgboost", "zoo")
+
+install_load <- function(packages){
+     for (p in packages) {
+          if (p %in% rownames(installed.packages())) {
+               library(p, character.only=TRUE)
+          } else {
+               install.packages(p)
+               library(p,character.only = TRUE)
+          }
+     }
+}
+suppressMessages(install_load(requiredpackages))
+rm(requiredpackages, install_load)
+```
+
+```{r Tech Ind functions}
+#Create technical indicator functions
+
+#Price momentum MOM
+mymom <- function(price, n) {
+  mom <- rep(0, length(price))
+  N <- length(price)
+  for (i in (n + 1):(N-n)) {
+    mom[i] <- price[i] - price[i - n]
+  }
+  return(mom)
+}
+
+#Percentage Range PR
+mypr <- function (price,n){
+  pr <- c()
+  pr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- ((max(price[(i-n):i])))
+    min.temp <- ((min(price[(i-n):i])))
+    price.temp <- price[i]
+    numerator <- max.temp - price.temp
+    denominator <- max.temp - min.temp
+    pr[i] <- 100 * (numerator / denominator)
+  }
+  return(pr)
+}
+
+#Absolute True Range ATR
+myatr <- function (price,n){
+  atr <- c()
+  tr <- c()
+  atr[1:(n-1)] <- NA
+  tr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- max(price[(i-n+1):i])
+    min.temp <- min(price[(i-n+1):i])
+    price.temp <- price[i]
+    A.temp <- max.temp - min.temp
+    B.temp <- abs(max.temp - price.temp)
+    C.temp <- abs(min.temp - price.temp)
+    TR.temp <- max(c(A.temp, B.temp, C.temp))
+    tr[i] <- TR.temp
+    atr[i] <- sum(tr[(i-n+1):i])
+  }
+  return(atr)
+}
+
+#Average Directional Movement Index ADX
+myadx <- function(price, n) {
+  adx <- numeric(length(price))
+  priceup <- numeric(length(price))
+  pricedown <- numeric(length(price))
+  adx[1:(n-1)] <- NA
+  priceup[1:(n-1)] <- NA
+  pricedown[1:(n-1)] <- NA
+  for (i in n:length(price)) {
+    if (!is.na(price[i]) && !is.na(price[(i-n+1)]) && price[i] - price[(i-n+1)] > 0) {
+      priceup[i] <- price[i] - price[(i-n+1)]
+    } else {
+      pricedown[i] <- price[i] - price[(i-n+1)]
+    }
+    positiveDM <- sum(priceup[(i-n+1):i], na.rm = TRUE)
+    negativeDM <- -sum(pricedown[(i-n+1):i], na.rm = TRUE)
+    tr <- sum(abs(diff(price[(i-n+1):(i+1)])), na.rm = TRUE)
+    plusDI <- (positiveDM / tr) * 100
+    minusDI <- (negativeDM / tr) * 100
+    adx[i] <- (abs(plusDI - minusDI) / (plusDI + minusDI)) * 100
+  }
+  return(adx)
+}
+
+#Relative Strength index RSI
+calculate_RSIs <- function(price, s) {
+  n <- length(price)
+  up <- numeric(n)
+  down <- numeric(n)
+  up[1] <- 0
+  down[1] <- 0
+  
+  for (i in 2:n) {
+    diff_price <- price[i] - price[i - 1]
+    if (!is.na(diff_price) && diff_price > 0) {
+      up[i] <- diff_price
+      down[i] <- 0
+    } else if (!is.na(diff_price) && diff_price < 0) {
+      up[i] <- 0
+      down[i] <- abs(diff_price)
+    } else {
+      up[i] <- 0
+      down[i] <- 0
+    }
+  }
+  
+  avg_up <- rollapply(up, width = s, FUN = mean, align = "right", fill = NA)
+  avg_down <- rollapply(down, width = s, FUN = mean, align = "right", fill = NA)
+  
+  RS <- avg_up / avg_down
+  RSI <- 100 - (100 / (1 + RS))
+  
+  return(as.vector(as.numeric(RSI)))
+}
+
+#Mean Absolute Convergence/Divergence MACD
+calculate_MACD <- function(price, a, b) {
+  ma_a <- stats::filter(price, rep(1/a, a), sides = 1)
+  ma_b <- stats::filter(price, rep(1/b, b), sides = 1)
+  macd <- ma_a - ma_b
+  
+  return(as.numeric(macd))
+}
+```
+
+```{r Import data for ida1}
+
+# read in from 28/8/19 to 19/10/23
+suppressMessages(data <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/All Data - DAM & IDA1.xlsx", sheet="IDA1", col_names = TRUE)[2785:75456,c(2,4,6:12,15:17,21:22)])
+colnames(data) <- c('Year', 'Month', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'Gas', 'PriceIDA1', 'VolIDA1', 'HH', 'ForecastWind')
+
+# arrange columns
+data <- data[, c('Year', 'Month', 'DOM', 'HH', 'PriceDAM', 'VolDAM', 'DOY', 'DOW', 'WOY', 'Quarter', 'Gas', 'ForecastWind', 'PriceIDA1', 'VolIDA1')]
+
+# sanity check for errors
+summary(data) # NAs in PriceIDA1 and VolIDA1 data
+
+# zero volume in dam and ida1 is unexpected - change to NAs for imputation
+data$VolDAM[data$VolDAM==0] <- NA
+data$VolIDA1[data$VolIDA1==0] <- NA
+
+# KNN imputation from 'credit model' package
+data$VolDAM <- knn_nas_imp(dat = data, x = 'VolDAM', k = 48, method = "avg_dist") %>% unlist() %>%  as.vector()
+data$VolIDA1 <- knn_nas_imp(dat = data, x = 'VolIDA1', k = 48, method = "avg_dist") %>% unlist() %>%  as.vector()
+data$PriceIDA1 <- knn_nas_imp(dat = data, x = 'PriceIDA1', k = 48, method = "avg_dist") %>% unlist() %>%  as.vector()
+
+# indicators from TTR package
+data$EMA <- TTR::EMA(data$PriceIDA1, n=48)
+data$SMA <- TTR::SMA(data$PriceIDA1, n=48)
+data$Momentum <- TTR::momentum(data$PriceIDA1, n=48)
+data$ROC <- TTR::ROC(data$PriceIDA1, n=48)
+data$MACD<- TTR::MACD(data$PriceIDA1, nFast = 24, nSlow = 48)
+data$RSI<- TTR::RSI(data$PriceIDA1, n=48)
+
+# categorical predictors
+data$Year <- as.factor(data$Year)
+data$Month <- as.factor(data$Month)
+data$DOM <- as.factor(data$DOM)
+data$HH <- as.factor(data$HH)
+data$DOW <- as.factor(data$DOW)
+data$WOY <- as.factor(data$WOY)
+data$Quarter <- as.factor(data$Quarter)
+
+# # Add tech indicators to data frame
+# data$MACD <- data$PriceIDA1 %>% calculate_MACD(24, 48)
+# data$RSI <- data$PriceIDA1 %>% calculate_RSIs(48)
+# data$ADX <- data$PriceIDA1 %>% myadx(48)
+# data$ATR <- data$PriceIDA1 %>% myatr(48)
+# data$MOM <- data$PriceIDA1 %>% mymom(48)
+# data$PR <- data$PriceIDA1 %>% mypr(48)
+# 
+# # kNN imputation for TIs
+# data$ATR <- knn_nas_imp(dat = data, x = 'ATR', k = 48, method = "avg_dist") %>% unlist() %>%  as.vector()
+# data$PR <- knn_nas_imp(dat = data, x = 'PR', k = 48, method = "avg_dist") %>% unlist() %>%  as.vector()
+# data$MACD <- knn_nas_imp(dat = data, x = 'MACD', k = 48, method = "avg_dist") %>% unlist() %>%  as.vector()
+# data$RSI <- knn_nas_imp(dat = data, x = 'RSI', k = 48, method = "avg_dist") %>% unlist() %>%  as.vector()
+# data$ADX <- knn_nas_imp(dat = data, x = 'ADX', k = 48, method = "avg_dist") %>% unlist() %>%  as.vector()
+
+# at this stage, all data is contained in the 'data' variable and missing values dealt with
+# DAM Bids need to be entered by 11am the day before & IDA1 Bids need to be entered by 3:30pm the day before
+# Therefore lag DAM price and volume by 9 to account for the 4.5 hour difference.
+
+# lag VolDAM and PriceDAM
+for (i in c((48+9), (96+9), (336+9))) {
+  for (name in c("PriceDAM", "VolDAM")) {
+    column_name <- paste0(name, "_lag", i, "hh")
+    data[[column_name]] <- lag(data[[name]], n = i)
+  }
+}
+
+# lag VolIDA1 and PriceIDA1
+for (i in c(48, 96, 336)) {
+  for (name in c("PriceIDA1", "VolIDA1", "Gas", 'EMA', 'SMA', 'Momentum', 'ROC', 'MACD', 'RSI')) {
+    column_name <- paste0(name, "_lag", i, "hh")
+    data[[column_name]] <- lag(data[[name]], n = i)
+  }
+}
+
+rm(column_name, i, name)
+data <- data[2762:nrow(data),]
+
+# at this stage, all data contained in 'data' is in the correct format
+
+# back up data variable
+data2 <- data
+
+```
+
+```{r selecting num vars if correlated with each other}
+
+suppressWarnings(data <- data[, !colnames(data) %in% c('Gas', 'VolDAM', 'PriceDAM', 'VolIDA1', 'ATR', 'MOM', 'RSI', 'MACD', 'PR', 'ADX')])
+
+# index vectors of num vars
+numericVars <- which(sapply(data, is.numeric))
+
+# index vector of categ vars
+factorVars <- which(sapply(data, is.factor))
+
+# list of num and categ variables
+numericVarNames <- colnames(data[numericVars])
+DFnumeric <- data[, names(data) %in% numericVarNames & names(data) %in% c('PriceDAM')]
+DFcategorical <- data[, !names(data) %in% numericVarNames]
+
+# correlation of predictors
+cor.ida1 <- cor(data[, numericVars], use="pairwise.complete.obs") #correlations of all numeric variables
+cor_sorted <- as.matrix(sort(cor.ida1[,'PriceIDA1'], decreasing = TRUE))
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.00000000000002)))
+cor.ida1 <- cor.ida1[CorHigh, CorHigh]
+corrplot.mixed(cor.ida1, tl.col="black", tl.pos = "lt", number.cex=0.7)
+
+# for highly correlated predictor variables, remove the one that correlates less strongly with PriceDAM if needed
+#data <- data[, !colnames(data) %in% c('ATR_lag48hh', 'ATR_lag96hh', 'ATR_lag336hh', 'VolDAM_lag57hh', 'MOM_lag336hh', 'RSI_lag48hh', 'RSI_lag96hh', 'VolDAM_lag105hh')]
+```
+
+```{r split data into train and test (hold out) subsets}
+
+# training data will contain 2019-2022
+data.ida1.train <- data[1:58311,]
+
+# testing data will contain 2023 up to 14-0ct-23
+data.ida1.test <- data[(nrow(data.ida1.train)+1):72087,]
+
+# prediction will be for 15-19-oct-23 will be used as hold out
+# sanity check row numbers
+nrow(data.ida1.train) + nrow(data.ida1.test) + (48*5) == nrow(data)
+
+# remove outcome var from test dataset
+data.ida1.test <- select(data.ida1.test, -c(PriceIDA1))
+
+# labels for xgb are the values of the target variable
+labels.ida1 <- data$PriceIDA1
+
+# extract variable names without outcome variable
+vars.ida1 <- colnames(data.ida1.test)
+
+# use vtreat to design variable 'treatments' with no outcome variable
+train.ida1 <- designTreatmentsZ(data.ida1.train, vars.ida1)
+newvars.ida1 <-  train.ida1$scoreFrame %>%
+  filter(code %in% c("clean", "lev")) %>%
+  use_series(varName)
+
+# prepare data.ida1 with the required vars
+data.ida1.train <- prepare(train.ida1, data.ida1.train, varRestriction = newvars.ida1)
+
+# set seed for reproducibility
+set.seed(28)
+# run cross-val model
+cv.ida1 <- xgb.cv(data = as.matrix(data.ida1.train), 
+            label = labels.ida1[1:nrow(data.ida1.train)],
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+nrounds.ida1 <- which.min(cv.ida1$evaluation_log$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.ida1 <- xgboost(data = as.matrix(data.ida1.train), 
+                 label = labels.ida1[1:nrow(data.ida1.train)],
+                 nrounds = nrounds.ida1,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.ida1 <- xgb.importance(feature_names <- newvars.ida1, model = model.ida1)
+xgb.ggplot.importance(importance_matrix = importance.ida1[1:10])
+
+# apply to test (hold out) data - 2023 in this case
+data.ida1.test <- prepare(train.ida1, data.ida1.test, varRestriction = newvars.ida1)
+data.ida1.test$pred <- predict(model.ida1, as.matrix(data.ida1.test))
+
+outcomes <- cbind("Actual" = data$PriceIDA1[(nrow(data.ida1.train)+1):(nrow(data)-(48*5))], "Predicted" = data.ida1.test$pred)
+
+#write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/IDA1v2 - IDA1 Predictions - Predict 2023.csv")
+```
+
+```{r retrain 2019-2023 and predict 2023 +1 day 15oct23}
+
+# training data will contain 2019-2023 this time (up to and incl 14-oct-23)
+data.ida1.train <- data[1:72087,]
+
+# hold out data will contain the +1 day (15-oct-23)
+data.ida1.test <- data[(nrow(data.ida1.train)+1):(nrow(data.ida1.train)+48),]
+
+# sanity check row numbers
+nrow(data.ida1.train) + nrow(data.ida1.test) + (48*4) == nrow(data)
+
+# remove outcome vars from test dataset
+data.ida1.test <- select(data.ida1.test, -c(PriceIDA1))
+
+# extract variable names without outcome variable
+vars.ida1 <- colnames(data.ida1.test)
+
+# use vtreat to design variable 'treatments' with no outcome variable
+train.ida1 <- designTreatmentsZ(data.ida1.train, vars.ida1)
+newvars.ida1 <-  train.ida1$scoreFrame %>%
+  filter(code %in% c("clean", "lev")) %>%
+  use_series(varName)
+
+# prepare data.ida1 with the required vars
+data.ida1.train <- prepare(train.ida1, data.ida1.train, varRestriction = newvars.ida1)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.ida1 <- xgb.cv(data = as.matrix(data.ida1.train),
+            label = labels.ida1[1:nrow(data.ida1.train)],
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+nrounds.ida1 <- which.min(cv.ida1$evaluation_log$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.ida1 <- xgboost(data = as.matrix(data.ida1.train), 
+                 label = labels.ida1[1:nrow(data.ida1.train)],
+                 nrounds = nrounds.ida1,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.ida1 <- xgb.importance(feature_names <- newvars.ida1, model = model.ida1)
+xgb.ggplot.importance(importance_matrix = importance.ida1[1:10])
+
+# apply to test (hold out) data
+data.ida1.test <- prepare(train.ida1, data.ida1.test, varRestriction = newvars.ida1)
+data.ida1.test$pred <- predict(model.ida1, as.matrix(data.ida1.test))
+
+outcomes <- cbind("Actual" = data$PriceIDA1[(nrow(data.ida1.train)+1):(nrow(data.ida1.train)+48)], "Predicted" = data.ida1.test$pred, "Date" = paste0(data.ida1.test$DOM," ",data.ida1.test$Month," ",data.ida1.test$Year," ",data.ida1.test$Hour))
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/IDA1v2/15.10.2023/IDA1v2 - IDA1 lagged Gas Vol and TIs with retraining cv No Vars Removed Predict 151023 .csv")
+
+```
+
+```{r retrain 2019-2023 and predict 2023 +1 day 16oct23}
+
+# training data will contain 2019-2023 this time (up to and incl 15-oct-23)
+data.ida1.train <- data[1:72135,]
+
+# hold out data will contain the +1 day (16-oct-23)
+data.ida1.test <- data[(nrow(data.ida1.train)+1):(nrow(data.ida1.train)+48),]
+
+# sanity check row numbers
+nrow(data.ida1.train) + nrow(data.ida1.test) + (48*3) == nrow(data)
+
+# remove outcome vars from test dataset
+data.ida1.test <- select(data.ida1.test, -c(PriceIDA1))
+
+# extract variable names without outcome variable
+vars.ida1 <- colnames(data.ida1.test)
+
+# use vtreat to design variable 'treatments' with no outcome variable
+train.ida1 <- designTreatmentsZ(data.ida1.train, vars.ida1)
+newvars.ida1 <-  train.ida1$scoreFrame %>%
+  filter(code %in% c("clean", "lev")) %>%
+  use_series(varName)
+
+# prepare data.ida1 with the required vars
+data.ida1.train <- prepare(train.ida1, data.ida1.train, varRestriction = newvars.ida1)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.ida1 <- xgb.cv(data = as.matrix(data.ida1.train),
+            label = labels.ida1[1:nrow(data.ida1.train)],
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+nrounds.ida1 <- which.min(cv.ida1$evaluation_lo$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.ida1 <- xgboost(data = as.matrix(data.ida1.train), 
+                 label = labels.ida1[1:nrow(data.ida1.train)],
+                 nrounds = nrounds.ida1,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.ida1 <- xgb.importance(feature_names <- newvars.ida1, model = model.ida1)
+xgb.ggplot.importance(importance_matrix = importance.ida1[1:10])
+
+# apply to test (hold out) data
+data.ida1.test <- prepare(train.ida1, data.ida1.test, varRestriction = newvars.ida1)
+data.ida1.test$pred <- predict(model.ida1, as.matrix(data.ida1.test))
+
+outcomes <- cbind("Actual" = data$PriceIDA1[(nrow(data.ida1.train)+1):(nrow(data.ida1.train)+48)], "Predicted" = data.ida1.test$pred, "Date" = paste0(data.ida1.test$DOM," ",data.ida1.test$Month," ",data.ida1.test$Year," ",data.ida1.test$Hour))
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/IDA1v2/15.10.2023/IDA1v2 - IDA1 lagged Gas Vol and TIs with retraining cv No Vars Removed Predict 161023 .csv")
+
+```

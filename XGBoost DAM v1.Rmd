@@ -1,0 +1,555 @@
+---
+title: "ExAnte XGBoost"
+output: html_document
+date: "2023-08-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#Load required packages
+requiredpackages <- c('xgboost', 'caTools', 'dplyr', 'cvms', 'caret', 'readxl', 'zoo', 'readxl', 'DiagrammeRsvg', 'rsvg')
+
+install_load <- function(packages){
+     for (p in packages) {
+          if (p %in% rownames(installed.packages())) {
+               library(p, character.only=TRUE)
+          } else {
+               install.packages(p)
+               library(p,character.only = TRUE)
+          }
+     }
+}
+
+install_load(requiredpackages)
+rm(requiredpackages)
+```
+
+```{r}
+#Create technical indicator functions
+
+#Price momentum MOM
+mymom <- function(price, n) {
+  mom <- rep(0, length(price))
+  N <- length(price)
+  for (i in (n + 1):(N-n)) {
+    mom[i] <- price[i] - price[i - n]
+  }
+  return(mom)
+}
+
+#Percentage Range PR
+mypr <- function (price,n){
+  pr <- c()
+  pr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- ((max(price[(i-n):i])))
+    min.temp <- ((min(price[(i-n):i])))
+    price.temp <- price[i]
+    numerator <- max.temp - price.temp
+    denominator <- max.temp - min.temp
+    pr[i] <- 100 * (numerator / denominator)
+  }
+  return(pr)
+}
+
+#Absolute True Range ATR
+myatr <- function (price,n){
+  atr <- c()
+  tr <- c()
+  atr[1:(n-1)] <- NA
+  tr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- max(price[(i-n+1):i])
+    min.temp <- min(price[(i-n+1):i])
+    price.temp <- price[i]
+    A.temp <- max.temp - min.temp
+    B.temp <- abs(max.temp - price.temp)
+    C.temp <- abs(min.temp - price.temp)
+    TR.temp <- max(c(A.temp, B.temp, C.temp))
+    tr[i] <- TR.temp
+    atr[i] <- sum(tr[(i-n+1):i])
+  }
+  return(atr)
+}
+
+#Average Directional Movement Index ADX
+myadx <- function(price, n) {
+  adx <- numeric(length(price))
+  priceup <- numeric(length(price))
+  pricedown <- numeric(length(price))
+  adx[1:(n-1)] <- NA
+  priceup[1:(n-1)] <- NA
+  pricedown[1:(n-1)] <- NA
+  for (i in n:length(price)) {
+    if (!is.na(price[i]) && !is.na(price[(i-n+1)]) && price[i] - price[(i-n+1)] > 0) {
+      priceup[i] <- price[i] - price[(i-n+1)]
+    } else {
+      pricedown[i] <- price[i] - price[(i-n+1)]
+    }
+    positiveDM <- sum(priceup[(i-n+1):i], na.rm = TRUE)
+    negativeDM <- -sum(pricedown[(i-n+1):i], na.rm = TRUE)
+    tr <- sum(abs(diff(price[(i-n+1):(i+1)])), na.rm = TRUE)
+    plusDI <- (positiveDM / tr) * 100
+    minusDI <- (negativeDM / tr) * 100
+    adx[i] <- (abs(plusDI - minusDI) / (plusDI + minusDI)) * 100
+  }
+  return(adx)
+}
+
+#Relative Strength index RSI
+calculate_RSIs <- function(price, s) {
+  n <- length(price)
+  up <- numeric(n)
+  down <- numeric(n)
+  up[1] <- 0
+  down[1] <- 0
+  
+  for (i in 2:n) {
+    diff_price <- price[i] - price[i - 1]
+    if (!is.na(diff_price) && diff_price > 0) {
+      up[i] <- diff_price
+      down[i] <- 0
+    } else if (!is.na(diff_price) && diff_price < 0) {
+      up[i] <- 0
+      down[i] <- abs(diff_price)
+    } else {
+      up[i] <- 0
+      down[i] <- 0
+    }
+  }
+  
+  avg_up <- rollapply(up, width = s, FUN = mean, align = "right", fill = NA)
+  avg_down <- rollapply(down, width = s, FUN = mean, align = "right", fill = NA)
+  
+  RS <- avg_up / avg_down
+  RSI <- 100 - (100 / (1 + RS))
+  
+  return(as.vector(as.numeric(RSI)))
+}
+
+#Mean Absolute Convergence/Divergence MACD
+calculate_MACD <- function(price, a, b) {
+  ma_a <- stats::filter(price, rep(1/a, a), sides = 1)
+  ma_b <- stats::filter(price, rep(1/b, b), sides = 1)
+  macd <- ma_a - ma_b
+  
+  return(as.numeric(macd))
+}
+
+# Function to calculate Price percent Change Moving Average (PPCMA)
+calculate_PPCMA <- function(price, n) {
+  ppcma <- c()
+  ppcma[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    pricei <- price[i]
+    pricelag48 <- price[((i-n)+1)]
+    ppc <- ((pricei - pricelag48) / pricelag48) * 100
+    ppcma[i] <- mean(ppc[(i-n+1):(i-1)])
+  }
+  return(ppcma)
+}
+
+
+# Function to calculate Mean Absolute Deviation (MAD)
+calculate_MADs <- function(prices, PPCMA) {
+  MADs <- (prices - PPCMA) / PPCMA
+  return(MADs)
+}
+
+```
+
+```{r}
+#Read in data for training model
+suppressWarnings(df <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Presentation/All Data Presentation.xlsx", col_types = "numeric")[1:71610,2:7])
+data <- data.frame(df)
+
+price.dam <- unlist(data$PriceDAM)
+price.ida1 <- unlist(data$PriceIDA1)
+
+#calculate the TIs for dam
+ppcma.dam <- calculate_PPCMA(price.dam, 24)
+mad.dam <- calculate_MADs(price.dam, ppcma.dam)
+mom.dam <- mymom(price.dam, 24)
+pr.dam <- mypr(price.dam, 24)
+atr.dam <- myatr(price.dam, 24)
+adx.dam <- myadx(price.dam, 24)
+rsi.dam <- calculate_RSIs(price.dam, 24)
+macd.dam <- calculate_MACD(price.dam, 12, 24)
+
+# calculate TIs for ida1
+ppcma.ida1 <- calculate_PPCMA(price.ida1, 48)
+mad.ida1 <- calculate_MADs(price.ida1, ppcma.ida1)
+mom.ida1 <- mymom(price.ida1,48)
+pr.ida1 <- mypr(price.ida1, 48)
+atr.ida1 <- myatr(price.ida1, 48)
+adx.ida1 <- myadx(price.ida1, 48)
+rsi.ida1 <- calculate_RSIs(price.ida1,48)
+macd.ida1 <- calculate_MACD(price.ida1, 24, 48)
+
+#create dataframe with technical indicators & correct headings
+dataindic <- data
+dataindic[ncol(dataindic)+1] <- mad.dam
+nameslist <- names(dataindic)
+nameslist[length(dataindic)] <- "MAD DAM"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- pr.dam
+nameslist[ncol(dataindic)] <- "PR DAM"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- mom.dam
+nameslist[ncol(dataindic)] <- "MOM DAM"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- atr.dam
+nameslist[ncol(dataindic)] <- "ATR DAM"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- adx.dam
+nameslist[ncol(dataindic)] <- "ADX DAM"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- rsi.dam
+nameslist[ncol(dataindic)] <- "RSI DAM"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- macd.dam
+nameslist[ncol(dataindic)] <- "MACD DAM"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- ppcma.dam
+nameslist[ncol(dataindic)] <- "PPCMA DAM"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- mad.ida1
+nameslist[length(dataindic)] <- "MAD IDA1"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- pr.ida1
+nameslist[ncol(dataindic)] <- "PR IDA1"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- mom.ida1
+nameslist[ncol(dataindic)] <- "MOM IDA1"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- atr.ida1
+nameslist[ncol(dataindic)] <- "ATR IDA1"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- adx.ida1
+nameslist[ncol(dataindic)] <- "ADX IDA1"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- rsi.ida1
+nameslist[ncol(dataindic)] <- "RSI IDA1"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- macd.ida1
+nameslist[ncol(dataindic)] <- "MACD IDA1"
+names(dataindic) <- nameslist
+dataindic[ncol(dataindic)+1] <- ppcma.ida1
+nameslist[ncol(dataindic)] <- "PPCMA IDA1"
+names(dataindic) <- nameslist
+
+#change missing values to 0
+dataindic <- dataindic %>% 
+  mutate_if(is.integer, ~replace(., is.na(.), 0))
+dataindic <- dataindic %>% 
+  mutate_if(is.numeric, ~replace(., is.na(.), 0))
+
+df <- dataindic
+```
+
+```{r}
+#DAM
+
+#set.seed(310)
+#separate your data into training and testing subsets
+sample_split <- sample.split(Y = df$PriceDAM, SplitRatio = 0.7)
+train_set <- subset(x = df, sample_split == TRUE)
+test_set <- subset(x = df, sample_split == FALSE)
+
+#split each of the training and testing subsets into target feature (DAM Price; y) and other features (X) 
+y_train <- train_set$PriceDAM - 1
+y_test <- test_set$PriceDAM - 1
+X_train <- train_set %>% select(-PriceDAM)
+X_test <- test_set %>%  select(-PriceDAM)
+
+#create data structures for training and testing datasets
+xgb_train <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+xgb_test <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+
+#create parameters for the model
+xgb_params <- list(
+  booster = "gbtree", # the type of boost to use
+  eta = 0.05, # the learning rate or shrinkage
+  max_depth = 4, # the depth of the tree; too high makes overfitting more likely; range 0-inf
+  gamma = 500, # the minimum loss reduction needed before making another leaf node; higher number = more conservative
+  subsample = 0.6, # the amount of data to use for subsampling which occurs every iteration
+  colsample_bytree = 0.5, # this is the number of subsamples that happen for each tree; range 0-1
+  objective = "reg:squarederror", # learning goal of the model
+  eval_metric = "mlogloss"
+)
+
+#now you can build the model
+xgb_model <- xgb.train(
+  params = xgb_params,
+  data = xgb_train,
+  nrounds = 5000,
+  verbose = 1
+)
+xgb_model
+
+#create an 'importance matrix' of the features that are important
+imp_mat <- xgb.importance(
+  feature_names = colnames(xgb_train),
+  model = xgb_model
+)
+xgb.plot.importance(imp_mat)
+
+plot0 <- xgb.plot.importance(imp_mat)
+
+#create importance plot
+ggplot(data=plot0, aes(y=Feature, x=Importance)) +
+  geom_bar(stat="identity", fill = 'light blue') + 
+  geom_text(aes(label = sprintf("%.3f", Importance)),colour = 'black',  vjust = -0.3, size = 3.5) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1)) +
+  theme_bw() +
+  labs(title = "DAM Indicator Importance Matrix", x = "Proportion", y = "Technical / Fundamental Indicator") +
+  xlim(c(0,0.4))
+```
+
+```{r}
+ggsave("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Presentation/DAM Feature Importance Matrix.png", plot = last_plot(), width = 12, height = 8, dpi = 1000)
+```
+
+```{r}
+#make predictions using the model
+xgb_preds <- predict(xgb_model, as.matrix(X_test), reshape = TRUE)
+xgb_preds <- as.data.frame(xgb_preds)
+colnames(xgb_preds) <- "PredictedPrice"
+
+#evaluate predictions
+xgb_preds$ActualPrice <- y_test
+xgb_preds
+
+#evaluate overall accuracy of model
+mse <- mean((xgb_preds$PredictedPrice - xgb_preds$ActualPrice)^2) #avg of squared differences in pred and actual vals
+rmse <- sqrt(mse) #avg magnitude of errors between pred and actual values
+mae <- mean(abs(xgb_preds$PredictedPrice - xgb_preds$ActualPrice)) # average of absolute differences between pred & actual values; less sens to outliers than mse
+sst <- sum((xgb_preds$ActualPrice - mean(xgb_preds$ActualPrice))^2)
+ssr <- sum((xgb_preds$ActualPrice - xgb_preds$PredictedPrice)^2)
+rsquared <- 1-(ssr/sst)
+eval_metrics <- xgb_model$evaluation_log
+eval_value <- eval_metrics
+
+# Print the performance results
+cat("Mean Squared Error (MSE): ", mse, "\n")
+cat("Root Mean Squared Error (RMSE): ", rmse, "\n")
+cat("Mean Absolute Error (MAE): ", mae, "\n")
+cat("R-Squared (R2): ", rsquared, "\n")
+cat("Multiclass Logarithmic Loss (mlogloss): ", eval_value, "\n")
+```
+
+```{r}
+#IDA1
+
+#set.seed(311)
+#separate your data into training and testing subsets
+sample_split1 <- sample.split(Y = df$PriceIDA1, SplitRatio = 0.8)
+train_set1 <- subset(x = df, sample_split == TRUE)
+test_set1 <- subset(x = df, sample_split == FALSE)
+
+#split each of the training and testing subsets into target feature (DAM Price; y) and other features (X) 
+y_train1 <- train_set1$PriceIDA1 - 1
+y_test1 <- test_set1$PriceIDA1 - 1
+X_train1 <- train_set1 %>% select(-PriceIDA1)
+X_test1 <- test_set1 %>%  select(-PriceIDA1)
+
+#create data structures for training and testing datasets
+xgb_train1 <- xgb.DMatrix(data = as.matrix(X_train1), label = y_train1)
+xgb_test1 <- xgb.DMatrix(data = as.matrix(X_test1), label = y_test1)
+
+#create parameters for the model
+xgb_params1 <- list(
+  booster = "gbtree", # the type of boost to use
+  eta = 0.05, # the learning rate or shrinkage
+  max_depth = 4, # the depth of the tree; too high makes overfitting more likely; range 0-inf
+  gamma = 500, # the minimum loss reduction needed before making another leaf node; higher number = more conservative
+  subsample = 0.6, # the amount of data to use for subsampling which occurs every iteration
+  colsample_bytree = 0.5, # this is the number of subsamples that happen for each tree; range 0-1
+  objective = "reg:squarederror", # learning goal of the model; think this one is categorical
+  eval_metric = "mlogloss"
+)
+
+#now you can build the model
+xgb_model1 <- xgb.train(
+  params = xgb_params1,
+  data = xgb_train1,
+  nrounds = 5000,
+  verbose = 1
+)
+xgb_model1
+
+#create an 'importance matrix' of the features that are importance for classification
+imp_mat1 <- xgb.importance(
+  feature_names = colnames(xgb_train1),
+  model = xgb_model1
+)
+
+plot1 <- xgb.plot.importance(imp_mat1)
+
+#save importance plot
+ggplot(data=plot1, aes(y=Feature, x=Importance)) +
+  geom_bar(stat="identity", fill = 'light blue') + 
+  geom_text(aes(label = sprintf("%.3f", Importance)),colour = 'black',  vjust = -0.3, size = 3.5) +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1)) +
+  theme_bw() +
+  labs(title = "IDA1 Indicator Importance Matrix", x = "Proportion", y = "Technical / Fundamental Indicator") +
+  xlim(c(0,0.4))
+```
+
+```{r}
+ggsave("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Presentation/IDA1 Feature Importance Matrix.png", plot = last_plot(), width = 12, height = 8, dpi = 1000)
+```
+
+```{r}
+#make predictions using the model
+xgb_preds1 <- predict(xgb_model1, as.matrix(X_test1), reshape = TRUE)
+xgb_preds1 <- as.data.frame(xgb_preds1)
+colnames(xgb_preds1) <- "PredictedPriceIDA1"
+
+#evaluate predictions
+xgb_preds1$ActualPrice <- y_test1
+xgb_preds1
+
+#evaluate overall accuracy of model
+mse <- mean((xgb_preds1$PredictedPriceIDA1 - xgb_preds1$ActualPrice)^2) #avg of squared differences in pred and actual vals
+rmse <- sqrt(mse) #avg magnitude of errors between pred and actual values
+mae <- mean(abs(xgb_preds1$PredictedPrice - xgb_preds1$ActualPrice)) # average of absolute differences between pred & actual values; less sens to outliers than mse
+sst <- sum((xgb_preds1$ActualPrice - mean(xgb_preds1$ActualPrice))^2)
+ssr <- sum((xgb_preds1$ActualPrice - xgb_preds1$PredictedPrice)^2)
+rsquared <- 1-(ssr/sst)
+eval_metrics1 <- xgb_model1$evaluation_log
+eval_value1 <- eval_metrics$metric$mlogloss
+
+# Print the performance results
+cat("Mean Squared Error (MSE): ", mse, "\n")
+cat("Root Mean Squared Error (RMSE): ", rmse, "\n")
+cat("Mean Absolute Error (MAE): ", mae, "\n")
+cat("R-Squared (R2): ", rsquared, "\n")
+cat("Multiclass Logarithmic Loss (mlogloss): ", eval_value1, "\n")
+
+```
+
+
+
+
+
+
+
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~READ IN DATA FROM CHUNK 2 AGAIN WITH UPDATED ROW NUMBERS!~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+
+```{r}
+#predict DAM next half hour periods
+test_set <- dataindic
+y_test <- test_set$PriceDAM
+X_test <- test_set %>%  select(-PriceDAM)
+
+#make predictions using the model
+xgb_preds <- predict(xgb_model, as.matrix(X_test), reshape = TRUE)
+xgb_preds <- as.data.frame(xgb_preds)
+colnames(xgb_preds) <- "PredictedPrice"
+
+#evaluate predictions
+suppressWarnings(xgb_preds$ActualPrice <- unlist(read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/All Data.xlsx", col_types = "numeric")[1:71610,3]))
+xgb_preds <- data.frame(xgb_preds)
+
+#evaluate overall accuracy of model
+mse <- mean((xgb_preds$PredictedPrice - xgb_preds$ActualPrice)^2) #avg of squared differences in pred and actual vals
+rmse <- sqrt(mse) #avg magnitude of errors between pred and actual values
+mae <- mean(abs(xgb_preds$PredictedPrice - xgb_preds$ActualPrice)) # average of absolute differences between pred & actual values; less sens to outliers than mse
+sst <- sum((xgb_preds$ActualPrice - mean(xgb_preds$ActualPrice))^2)
+ssr <- sum((xgb_preds$ActualPrice - xgb_preds$PredictedPrice)^2)
+rsquared <- 1-(ssr/sst)
+
+# Print the performance results
+cat("Mean Squared Error (MSE): ", mse, "\n")
+cat("Root Mean Squared Error (RMSE): ", rmse, "\n")
+cat("Mean Absolute Error (MAE): ", mae, "\n")
+cat("R-Squared (R2): ", rsquared, "\n")
+
+#plot predicted vs actual for 010823
+predVactualDAM <- xgb_preds
+
+y_range <- range(0:200)
+x_range <- range(1:96)
+
+ggplot(data = predVactualDAM, mapping = aes(x = 1:96)) +
+  geom_line(y = predVactualDAM$PredictedPrice, aes(colour = "Predicted")) +
+  geom_line(y = predVactualDAM$ActualPrice, aes(colour = "Actual")) +
+  labs(y = "Price (pence)", x = "Half Hour", title = "DAM Price Prediction 8th & 9th Aug 2023 using Retrained XGBoost", color = NULL) +
+  theme_bw() +
+  scale_color_manual(values = c(Actual = "blue", Predicted = "red"),
+                     labels = c(Actual = "Actual", Predicted = "Predicted"),
+                     guide = guide_legend(override.aes = list(shape = c(NA, NA)))) +
+  ylim(y_range) +  # Set the y-axis limits
+  xlim(x_range)  # set the x-axis limits
+
+```
+
+```{r}
+ggsave("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Presentation/DAM Price Prediction 8th & 9th Aug 2023 using Retrained XGBoost [offset].png", plot = last_plot(), width = 12, height = 8, dpi = 1000)
+
+```
+
+```{r}
+#predict IDA1 next half hour periods
+df_new <- df[(nrow(df)-47):(nrow(df)),]
+
+test_set <- df_new
+y_test <- test_set$PriceIDA1
+X_test <- test_set %>%  select(-PriceIDA1)
+
+#make predictions using the model
+xgb_preds <- predict(xgb_model1, as.matrix(X_test), reshape = TRUE)
+xgb_preds <- as.data.frame(xgb_preds)
+colnames(xgb_preds) <- "PredictedPrice"
+
+#evaluate predictions
+suppressWarnings(xgb_preds$ActualPrice <- unlist(read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/All Data.xlsx", col_types = "numeric")[71947:71994,4]))
+xgb_preds <- data.frame(xgb_preds)
+
+#evaluate overall accuracy of model
+mse <- mean((xgb_preds$PredictedPrice - xgb_preds$ActualPrice)^2) #avg of squared differences in pred and actual vals
+rmse <- sqrt(mse) #avg magnitude of errors between pred and actual values
+mae <- mean(abs(xgb_preds$PredictedPrice - xgb_preds$ActualPrice)) # average of absolute differences between pred & actual values; less sens to outliers than mse
+sst <- sum((xgb_preds$ActualPrice - mean(xgb_preds$ActualPrice))^2)
+ssr <- sum((xgb_preds$ActualPrice - xgb_preds$PredictedPrice)^2)
+rsquared <- 1-(ssr/sst)
+
+# Print the performance results
+cat("Mean Squared Error (MSE): ", mse, "\n")
+cat("Root Mean Squared Error (RMSE): ", rmse, "\n")
+cat("Mean Absolute Error (MAE): ", mae, "\n")
+cat("R-Squared (R2): ", rsquared, "\n")
+
+#plot predicted vs actual for 010823
+predVactualDAM <- xgb_preds
+
+y_range <- range(0:200)
+x_range <- range(1:48)
+
+ggplot(data = predVactualDAM, mapping = aes(x = 1:48)) +
+  geom_line(y = predVactualDAM$PredictedPrice, aes(colour = "Predicted")) +
+  geom_line(y = predVactualDAM$ActualPrice, aes(colour = "Actual")) +
+  labs(y = "Price (pence)", x = "Half Hour", title = "IDA1 Price Prediction 8th Aug 2023 using Retrained XGBoost", color = NULL) +
+  theme_bw() +
+  scale_color_manual(values = c(Actual = "blue", Predicted = "red"),
+                     labels = c(Actual = "Actual", Predicted = "Predicted"),
+                     guide = guide_legend(override.aes = list(shape = c(NA, NA)))) +
+  ylim(y_range) +  # Set the y-axis limits
+  xlim(x_range)  # set the x-axis limits
+
+```
+```{r}
+ggsave("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Presentation/IDA1 Price Prediction 8th Aug 2023 using Retrained XGBoost [offset].png", plot = last_plot(), width = 12, height = 8, dpi = 1000)
+
+```
+
+
+```{r}
+
+```

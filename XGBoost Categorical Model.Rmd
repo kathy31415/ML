@@ -1,0 +1,201 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r pkgs}
+# Load required packages
+requiredpackages <- c("caret", "corrplot", "data.table", "digest", "dplyr", "ggplot2", "gridExtra", "Hmisc", "imputeTS", "lubridate", "magrittr", 'Matrix', "plyr", "psych", "rapport", "readxl", "stringr", "tidyverse", 'TTR', "vtreat", "xgboost", "zoo")
+
+install_load <- function(packages){
+     for (p in packages) {
+          if (p %in% rownames(installed.packages())) {
+               library(p, character.only=TRUE)
+          } else {
+               install.packages(p)
+               library(p,character.only = TRUE)
+          }
+     }
+}
+suppressMessages(install_load(requiredpackages))
+rm(requiredpackages, install_load)
+```
+
+```{r Import data.da for dam}
+# read in from 1/1/19 to 19/10/23
+suppressMessages(data <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/All Data - DAM & IDA1.xlsx", sheet="IDA1", col_names = TRUE)[2785:75456,c(20,6,7,22,15:17, 21)])
+colnames(data) <- c('DateTime', 'PriceDAM', 'VolDAM', 'ForecastWind', 'Gas', 'PriceIDA1', 'VolIDA1', 'HH')
+
+# decompose datetime
+data$DateTime <- as.POSIXct(data$DateTime, format = "%d/%m/%Y %H:%M", tz = "UTC")
+data$Day <- day(data$DateTime)
+data$Month <- month(data$DateTime)
+data$Year <- year(data$DateTime)
+data$Quarter <- quarter(data$DateTime)
+data$Semester <- lubridate::semester(data$DateTime)
+data$DOW <- lubridate::wday(data$DateTime, week_start = 1)
+
+# arrange columns
+data <- data[, c('DateTime', 'Day', 'Month', 'Year', 'HH', 'Quarter', 'Semester', 'DOW', 'Gas', 'ForecastWind', 'PriceDAM', 'VolDAM', 'PriceIDA1', 'VolIDA1')]
+
+# sanity check for errors
+summary(data) # NAs in VolDAM, PriceIDA1, VolIDA1 data
+
+# zero volume in dam and ida1 is unexpected - change to NAs for imputation
+data$VolDAM[data$VolDAM==0] <- NA
+data$VolIDA1[data$VolIDA1==0] <- NA
+
+# Use STINE Interpolation as best for ts data.da as per Denhard et al (2021)
+data$VolDAM <- na_interpolation(x = data$VolDAM, option = "stine")
+data$PriceIDA1 <- na_interpolation(x = data$PriceIDA1, option = "stine")
+data$VolIDA1 <- na_interpolation(x = data$VolIDA1, option = "stine")
+
+# at this stage there should be no NAs
+sum(is.na(data))
+
+# Cheaper categorical variable
+data <- data %>% mutate(Cheaper = 
+                          case_when(data$PriceDAM - data$PriceIDA1 >= 0 ~ "IDA1",
+                                    data$PriceDAM - data$PriceIDA1 < 0 ~ "DAM")) %>% 
+  as.data.frame()
+
+# categorical predictors
+for (column in c('Day', 'Month', 'Year', 'HH', 'Quarter', 'Semester', 'DOW', 'Cheaper')) {
+  data[[column]] <- data[[column]] %>% as.factor()
+}
+rm(column)
+
+# Add tech indicators to data.da frame (TTR package)
+data$RSI.da <- RSI(data$PriceDAM, n = 24)
+data$MOM.da <- momentum(data$PriceDAM, n=24)
+data$EMA.da <- EMA(data$PriceDAM, n = 24)
+data$SMA.da <- SMA(data$PriceDAM, n = 24)
+
+data$RSI.ida1 <- RSI(data$PriceDAM, n = 48)
+data$MOM.ida1 <- momentum(data$PriceDAM, n=48)
+data$EMA.ida1 <- EMA(data$PriceDAM, n = 48)
+data$SMA.ida1 <- SMA(data$PriceDAM, n = 48)
+
+# create lagged variables (1day, 2days, 3days)
+for (i in c(48, 96, 144)) {
+  for (name in c('Gas', 'ForecastWind', 'PriceDAM', 'VolDAM', 'PriceIDA1', 'VolIDA1')) { # , 'RSI', 'MOM', 'EMA', 'SMA', 'Cheaper')) {
+    column_name <- paste0(name, "_lag", i, "hh")
+    data[[column_name]] <- lag(data[[name]], n = i)
+  }
+}; rm(column_name, i, name)
+
+# remove vars we won't know the day of (but keep Cheaper because its the outcome)
+data <- suppressWarnings(data[, !colnames(data) %in% c('Gas', 'VolDAM', 'PriceDAM', 'VolIDA1', 'PriceIDA1')])
+data <- data[145:nrow(data),]
+sum(is.na(data))
+
+# at this stage, all data contained in 'data' is in the correct format
+
+# back up data.da variable
+data2 <- data
+```
+
+
+```{r selecting num vars if correlated with each other}
+
+# index vectors of num vars
+numericVars <- which(sapply(data, is.numeric))
+
+# index vector of categ vars
+factorVars <- which(sapply(data, is.factor))
+
+# list of num and categ variables
+numericVarNames <- colnames(data[numericVars])
+DFnumeric <- data[, names(data) %in% numericVarNames & names(data) %in% c('PriceDAM')]
+DFcategorical <- data[, !names(data) %in% numericVarNames]
+
+# correlation of predictors
+cor.dam <- cor(data[, numericVars], use="pairwise.complete.obs") #correlations of all numeric variables
+cor_sorted <- as.matrix(sort(cor.dam[,'Cheaper'], decreasing = TRUE))
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.0000000002)))
+cor.dam <- cor.dam[CorHigh, CorHigh]
+rm(numericVars, numericVarNames, factorVars, CorHigh, cor_sorted)
+corrplot.mixed(cor.dam, tl.col="black", tl.pos = "lt", number.cex = 0.75)
+```
+
+```{r plot categorical variable frequencies}
+
+ggplot(data = data, aes(x = Cheaper)) + 
+  geom_bar()
+
+```
+
+```{r split data.da into train and test (hold out) subsets}
+
+# training data will contain 2019-2022
+data.train <- data[1:58464,]
+
+# testing data will contain 2023 up to 14-0ct-23
+data.test <- data[58465:72240,]
+
+# sanity check row numbers
+nrow(data.train) + nrow(data.test) + (48*5) == nrow(data)
+
+# prepare data sets
+X_train <- select(data.train, -c(Cheaper)) %>% as.data.frame()
+y_train <- select(data.train, Cheaper) %>% unlist() %>% as.vector()
+y_train <- as.numeric(y_train == "IDA1") #NB 1=IDA1 and 0=DAM
+
+X_test <- select(data.test, -c(Cheaper)) %>% as.data.frame()
+y_test <- select(data.test, Cheaper) %>% unlist() %>% as.vector()
+y_test <- as.numeric(y_test == "IDA1") #NB 1=IDA1 and 0=DAM
+
+train_sparse <- sparse.model.matrix(y_train ~., data = X_train)
+test_sparse <- sparse.model.matrix(y_test ~., data = X_test)
+
+data.train <- xgb.DMatrix(data = train_sparse, label = y_train)
+data.test <- xgb.DMatrix(data = test_sparse, label = y_test)
+
+```
+
+```{r cross validation}
+# set seed for reproducibility
+set.seed(28)
+
+# run cross-val model
+model.cv <- xgb.cv(data = data.train, 
+            label = y_train,
+            nrounds = 500,
+            nfold = 5,
+            objective = "count:poisson",
+            eta = 0.1,
+            max_depth = 3,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+```
+
+
+```{r cross validation}
+nrounds <- which.max(model.cv$evaluation_log$test_poisson_nloglik_mean)
+
+# xgb on train data with best nrounds to get final model
+model <- xgboost(data = data.train, 
+                 label = y_train,
+                 nrounds = nrounds,
+                 objective = "count:poisson",
+                 eta = 0.01, #optimum$eta,
+                 max_depth = 4, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance <- xgb.importance(feature_names <- colnames(data.train), model = model)
+xgb.ggplot.importance(importance_matrix = importance)
+
+# apply to test (hold out) data - 2023 in this case
+preds <- predict(model, data.test)
+
+error <- model$evaluation_log$iter
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.train)+1):(nrow(data)-(24*5))], "Predicted" = preds, "ERROR" = error)
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/Predict 2023 - Categorical Model (poisson).csv")
+
+
+```

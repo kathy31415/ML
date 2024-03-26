@@ -1,0 +1,468 @@
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data")
+```
+
+```{r}
+#Load required packages
+suppressWarnings(requiredpackages <- c("readxl", "stringr", "tidyverse", "tidyselect", "caret", "e1071", "ggplot2", "dplyr", "digest", "gbm", "randomForest", "rpart", "rpart.plot", "Rtsne", "TTR", "matrixStats", "zoo", "lubridate", "RcppRoll", "zoo", "xgboost", "abind", "VIM"))
+
+install_load <- function(packages){
+     for (p in packages) {
+          if (p %in% rownames(installed.packages())) {
+               library(p, character.only=TRUE)
+          } else {
+               install.packages(p)
+               library(p,character.only = TRUE)
+          }
+     }
+}
+
+suppressWarnings(install_load(requiredpackages))
+rm(requiredpackages)
+```
+
+
+```{r}
+#function for creating different lags
+#basically creates a given number of lags across given variable using a loop
+Create_lags <- function(df, start_lag, end_lag) {
+  lags = seq(from = start_lag, to = start_lag + end_lag)
+  lag_names <- paste("lag", formatC(lags, width = nchar(max(lags)), flag = "0"),
+                     sep = "_")
+  lag_functions <- setNames(paste("dplyr::lag(., ", lags, ")"), lag_names)
+  print(lag_functions)
+  df <- df %>% 
+    mutate_at(vars(PriceDAM), funs_(lag_functions))    #funs is the looping part
+  return(df)
+}
+
+#function for creating additional lag features - think of as metafeatures
+Create_additional_lag_feats <- function(df) {
+  
+  lag_col_names = colnames(df[, (grepl("lag", colnames(df)))])
+  print(lag_col_names)
+  
+  for (i in 1:length(lag_col_names)) {
+    for (span in 1:i) {  # Loop from 1 to i to consider all combinations
+      cols = lag_col_names[1:span]
+      
+      colname_sd = paste0("lagsd_", "1to", span)
+      df[colname_sd] = rowSds(as.matrix(df[, cols]))
+
+      colname_max = paste0("lagmax_", "1to", span)
+      df[colname_max] = rowMaxs(as.matrix(df[, cols]))
+
+      colname_diff = paste0("lagdiff_", "1to", span)
+      df[colname_diff] = df[[lag_col_names[1]]] - df[[lag_col_names[span]]]
+
+      colname_div = paste0("lagdiv_", "1to", span)
+      df[colname_div] = df[[lag_col_names[1]]] / df[[lag_col_names[span]]]
+    }
+  }
+  
+  return(df)
+}
+
+#function for creating means with rolling windows
+Create_rolling_windows_means <- function(df, start_index, num_windows) {
+  roll_mean_l <- seq(from = start_index, to = start_index + num_windows)
+  for (win in roll_mean_l) {
+    new_col_name <- paste("rollmean", win, sep = "_")
+    
+    rolled_mean <- rollmean(df$PriceDAM, k = win, fill = NA, align = "right")
+    
+    df <- df %>%
+      mutate({{ new_col_name }} := rolled_mean)
+  }
+  return(df)
+}
+
+# function for calculating the standard deviation with rolling windows
+Create_rolling_windows_sds <- function(df, start_index, num_windows) {
+  roll_sd_l <- seq(from = start_index, to = start_index + num_windows)
+  
+  for (win in roll_sd_l) {
+    new_col_name <- paste("rollsd", win, sep = "_")
+    
+    rolled_sd <- roll_sd(df$PriceDAM, n = win, fill = NA, align = "right")
+    
+    df <- df %>%
+      mutate({{ new_col_name }} := rolled_sd)
+  }
+  
+  return(df)
+}
+```
+
+```{r Indicator Functions}
+#Create technical indicator functions
+
+#Price momentum MOM
+mymom <- function(price, n) {
+  mom <- rep(0, length(price))
+  N <- length(price)
+  for (i in (n + 1):(N-n)) {
+    mom[i] <- price[i] - price[i - n]
+  }
+  return(mom)
+}
+
+#Percentage Range PR
+mypr <- function (price,n){
+  pr <- c()
+  pr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- ((max(price[(i-n):i])))
+    min.temp <- ((min(price[(i-n):i])))
+    price.temp <- price[i]
+    numerator <- max.temp - price.temp
+    denominator <- max.temp - min.temp
+    pr[i] <- 100 * (numerator / denominator)
+  }
+  return(pr)
+}
+
+#Absolute True Range ATR
+myatr <- function (price,n){
+  atr <- c()
+  tr <- c()
+  atr[1:(n-1)] <- NA
+  tr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- max(price[(i-n+1):i])
+    min.temp <- min(price[(i-n+1):i])
+    price.temp <- price[i]
+    A.temp <- max.temp - min.temp
+    B.temp <- abs(max.temp - price.temp)
+    C.temp <- abs(min.temp - price.temp)
+    TR.temp <- max(c(A.temp, B.temp, C.temp))
+    tr[i] <- TR.temp
+    atr[i] <- sum(tr[(i-n+1):i])
+  }
+  return(atr)
+}
+
+#Average Directional Movement Index ADX
+myadx <- function(price, n) {
+  adx <- numeric(length(price))
+  priceup <- numeric(length(price))
+  pricedown <- numeric(length(price))
+  adx[1:(n-1)] <- NA
+  priceup[1:(n-1)] <- NA
+  pricedown[1:(n-1)] <- NA
+  for (i in n:length(price)) {
+    if (!is.na(price[i]) && !is.na(price[(i-n+1)]) && price[i] - price[(i-n+1)] > 0) {
+      priceup[i] <- price[i] - price[(i-n+1)]
+    } else {
+      pricedown[i] <- price[i] - price[(i-n+1)]
+    }
+    positiveDM <- sum(priceup[(i-n+1):i], na.rm = TRUE)
+    negativeDM <- -sum(pricedown[(i-n+1):i], na.rm = TRUE)
+    tr <- sum(abs(diff(price[(i-n+1):(i+1)])), na.rm = TRUE)
+    plusDI <- (positiveDM / tr) * 100
+    minusDI <- (negativeDM / tr) * 100
+    adx[i] <- (abs(plusDI - minusDI) / (plusDI + minusDI)) * 100
+  }
+  return(adx)
+}
+
+#Relative Strength index RSI
+calculate_RSIs <- function(price, s) {
+  n <- length(price)
+  up <- numeric(n)
+  down <- numeric(n)
+  up[1] <- 0
+  down[1] <- 0
+  
+  for (i in 2:n) {
+    diff_price <- price[i] - price[i - 1]
+    if (!is.na(diff_price) && diff_price > 0) {
+      up[i] <- diff_price
+      down[i] <- 0
+    } else if (!is.na(diff_price) && diff_price < 0) {
+      up[i] <- 0
+      down[i] <- abs(diff_price)
+    } else {
+      up[i] <- 0
+      down[i] <- 0
+    }
+  }
+  
+  avg_up <- rollapply(up, width = s, FUN = mean, align = "right", fill = NA)
+  avg_down <- rollapply(down, width = s, FUN = mean, align = "right", fill = NA)
+  
+  RS <- avg_up / avg_down
+  RSI <- 100 - (100 / (1 + RS))
+  
+  return(as.vector(as.numeric(RSI)))
+}
+
+#Mean Absolute Convergence/Divergence MACD
+calculate_MACD <- function(price, a, b) {
+  ma_a <- stats::filter(price, rep(1/a, a), sides = 1)
+  ma_b <- stats::filter(price, rep(1/b, b), sides = 1)
+  macd <- ma_a - ma_b
+  
+  return(as.numeric(macd))
+}
+
+# Function to calculate Price percent Change Moving Average (PPCMA)
+calculate_PPCMA <- function(price, n) {
+  ppcma <- c()
+  ppcma[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    pricei <- price[i]
+    pricelag48 <- price[((i-n)+1)]
+    ppc <- ((pricei - pricelag48) / pricelag48) * 100
+    ppcma[i] <- mean(ppc[(i-n+1):(i-1)])
+  }
+  return(ppcma)
+}
+
+# Function to calculate Mean Absolute Deviation (MAD)
+calculate_MADs <- function(prices, PPCMA) {
+  MADs <- (prices - PPCMA) / PPCMA
+  return(MADs)
+}
+```
+
+```{r Input Data from Excel}
+#Read in data
+suppressWarnings(data <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/All Data - DAM - Imputed.xlsx", col_names = TRUE)[,1:22])
+data <- select(data, -c('Temporary1':'wdsp Tipp'))
+colnames(data) <- c('Year', 'Date', 'Hour', 'PriceDAM', 'VolDAM', 'DOY', 'DOW', 'tempAvg', 'wdspAvg', 'forecastWind')
+
+#decompose date column
+data <- data %>% mutate(Day = as.numeric(format(data$Date,'%d')),
+                Quarter = as.numeric(substr(quarters((data$Date)), 2, 2)),
+                Month = as.numeric(format(data$Date, '%m')),
+                Year = as.numeric(substr(data$Year, 3,4)),
+                Week = as.numeric(week(ymd(data$Date))),
+)
+
+data <- data[, c(2,3,11,14,13,1,7,12,6,4,5,8,9,10)]
+data$Date = as.Date(data$Date, format = '%d/%m/%y')
+
+#temporary workaround because no new wind data from met eireann
+data <- data[, !(names(data) %in% c('tempAvg', 'wdspAvg'))]
+
+```
+
+```{r}
+# Median imputation for volume column
+missing <- data[data$VolDAM == 0,]
+missingna <- data[is.na(data$VolDAM) == TRUE,]
+missing_rows <- data$VolDAM == 0
+data$VolDAM[missing_rows] <- median(data$VolDAM, na.rm = TRUE)
+missingVol <- data[data$VolDAM == 0,] # should revert to zero if successful
+
+# Median imputation for Price column
+missing <- data[data$PriceDAM == 0,]
+missingna <- data[is.na(data$PriceDAM) == TRUE,]
+missing_rows <- data$PriceDAM == 0
+data$PriceDAM[missing_rows] <- median(data$PriceDAM, na.rm = TRUE)
+missingPrice <- data[data$PriceDAM == 0,] # should revert to zero if successful
+
+# Impute missing forecast wind values
+missing_rows <- is.na(data$forecastWind) == TRUE
+data$forecastWind[missing_rows] <- median(data$forecastWind, na.rm = TRUE)
+missing_rows <- is.na(data$forecastWind) == TRUE
+missingWind <- sum(missing_rows == TRUE) # should equal zero if successful
+
+# Find rows with missing values (NA)
+rows_with_missing <- which(rowSums(is.na(data)) > 0)
+df <- data[rows_with_missing,]
+```
+
+```{r}
+# Add tech indicators to data frame
+
+data$MACD <- data$PriceDAM %>% calculate_MACD(12, 24)
+#data$PPCMA <- data$PriceDAM %>% calculate_PPCMA(24)
+#data$MAD <- data$PriceDAM %>% calculate_MADs(data$PPCMA)
+data$RSI <- data$PriceDAM %>% calculate_RSIs(24)
+data$ADX <- data$PriceDAM %>% myadx(24)
+data$ATR <- data$PriceDAM %>% myatr(24)
+data$MOM <- data$PriceDAM %>% mymom(24)
+data$PR <- data$PriceDAM %>% mypr(24)
+```
+
+```{r}
+# Remove rows without TI values from xgb - these will be the beginning rows therefore the integrity of TS data remains intact
+data <- data[47:nrow(data),]
+
+# Check if succeeded
+rows_with_missing <- which(rowSums(is.na(data)) > 0)
+df <- data[rows_with_missing,]
+```
+
+```{r}
+#set global variables
+dirname = "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data"
+setwd(dirname)
+```
+
+```{r}
+# Set n rows for training data
+k <- round((nrow(data)-48))
+train <- data[1:k,]
+
+#summary function to ensure nothing is unexpectedly zero / -ve / NA
+summary(train)
+```
+
+```{r}
+#create test df with rows from data df that arent in train df
+test <- anti_join(data, train2)
+nrow(train2) + nrow(test) == nrow(data) #sanity check
+
+#test df should have only variables that are known prior to date
+test <- select(test, -c(,'PriceDAM'))
+test <- select(test, -c(,'MACD':'PR'))
+
+df.total <- data
+```
+
+```{r}
+#feature engineering
+start_index_lag = 1
+num_lags = 12
+start_index_rollfeat = 2
+num_rollfeat = 10
+forecast_horizon = 24
+
+train <- train %>% 
+  Create_lags(., start_index_lag, num_lags)
+train <- train %>% 
+  Create_rolling_windows_means(., start_index_rollfeat, num_rollfeat)
+train <- train %>% 
+  Create_rolling_windows_sds(., start_index_rollfeat, num_rollfeat)
+
+#train <- train %>% Create_additional_lag_feats()
+```
+
+```{r}
+#what cols to drop / keep
+feat.names <- colnames(train[, !colnames(train) %in% c("VolDAM", "tempAvg", "wdspAvg")])
+
+#pick a % for training and val
+k = 1
+
+#split the train data into Xtrain and Xval
+pivot_date <- as.Date(train$Date[(nrow(train)*k)], format = '%yyyy-%mm-%dd')
+Xtrain <- train %>% 
+  filter(Date < pivot_date)
+Xval <- train2 %>% 
+ filter(Date >= pivot_date)
+
+dim(Xtrain); dim(Xval)
+tra <- Xtrain[,feat.names]
+vra <- Xval[,feat.names]
+```
+
+```{r}
+#now attempt xgb model
+set.seed(318)
+
+dval <- xgb.DMatrix(data = data.matrix(vra), label = (Xval$PriceDAM))
+dtrain <- xgb.DMatrix(data = data.matrix(tra), label = (Xtrain$PriceDAM))
+
+dim(dtrain); dim(dval)
+
+watchlist <- list(train = dtrain, val = dval)
+param <- list(objective = "reg:linear",
+              booster = "gbtree",
+              eta = 0.1,
+              max_depth = 3,
+              subsample = 0.7,
+              colsample_bytree = 0.7,
+              gamma = 0.1)
+
+clf <- xgb.train(params = param,
+                 data = dtrain,
+                 nrounds = 5000,
+                 verbose = 0,
+                 early_stopping_rounds = 5,
+                 watchlist = watchlist,
+                 maximise = FALSE,
+                 eval = 'rmse')
+clf$best_iteration
+clf$best_score
+clf$best_ntreelimit
+```
+```{r}
+install.packages('Ckmeans.1d.dp')
+library(Ckmeans.1d.dp)
+```
+
+```{r}
+#importance matrix
+importance <- xgb.importance(
+  feature_names <- feat.names, model = clf
+)
+
+xgb.ggplot.importance(importance_matrix = importance)
+```
+```{r}
+# retrain with importance feats only
+train2 <- train[, colnames(train) %in% c("PriceDAM", "rollmean_2", "rollmean_3")]
+```
+
+```{r}
+#prediction of validation set
+pred1 <- predict(clf, data.matrix(vra))
+
+d <- tibble(pred = pred1,
+            obs = Xval$PriceDAM) %>% 
+  mutate(resid = pred - obs,
+         resiq_sq = resid^2)
+
+sstot <- sum((d$pred - mean(d$obs))^2)
+ssresid <- sum(d$resiq_sq)
+sprintf("percent variance explained, R^2: %2.2f%%", 100 * (1 - ssresid/sstot))
+
+rmse <- mean((pred1-Xval$PriceDAM)^2)
+```
+
+```{r}
+#plot predicted vs observed values
+plot(d$pred, d$obs, pch=16, col="blue", cex=.75,
+     xlab = "Predicted Power Output",
+     ylab = "Observed Power Output",
+     main = "XGBoost: Observed vs. Predicted")+
+lines(d$pred,
+      lm(a~b, data=data.frame(a=d$obs, b=d$pred))$fitted,
+      lwd=2, col="red")
+```
+
+```{r}
+#plot residuals vs predicted values
+plot(d$pred, d$resid, pch=16, col="blue", cex=.75,
+     xlab = "Residual Power Output",
+     ylab = "Predicted Power Output",
+     main = "XGBoost: Residual vs. Predicted") +
+  lines(d$pred,
+        lm(a~b, data=data.frame(a=d$resid, b=d$pred))$fitted,
+        lwd=2, col="red")
+```
+
+```{r}
+#predicted vals in table
+prediction.tab <- data.frame(Date = Xval$Date,
+                             Hour = Xval$Hour,
+                             DateTime = paste(as.Date(Xval$Date, format = 'yyyy-mm-dd'), Xval$Hour),
+                             PredPrice = round(pred1,1)) %>% 
+  arrange(Date, Hour) %>% 
+  mutate(key = "Predictions")
+```
+
+```{r}
+# Comparison df & stats
+results <- data.frame(Pred = prediction.tab$PredPrice, Actual = vra$PriceDAM)
+results$Difference <- results$Pred - results$Actual
+range(results$Difference)
+sum(results$Difference)
+
+writexl::write_xlsx(results, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/PredictionOutput3.xlsx")
+```
+

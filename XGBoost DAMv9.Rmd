@@ -1,0 +1,511 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r pkgs}
+# Load required packages
+requiredpackages <- c("caret", "corrplot", "data.table", "digest", "dplyr", "ggplot2", "gridExtra", "Hmisc", "imputeTS", "lubridate", "magrittr", 'Matrix', "plyr", "psych", "rapport", "readxl", "stringr", "tidyverse", 'TTR', "vtreat", "xgboost", "zoo")
+
+install_load <- function(packages){
+     for (p in packages) {
+          if (p %in% rownames(installed.packages())) {
+               library(p, character.only=TRUE)
+          } else {
+               install.packages(p)
+               library(p,character.only = TRUE)
+          }
+     }
+}
+suppressMessages(install_load(requiredpackages))
+rm(requiredpackages, install_load)
+```
+
+```{r Import data for dam}
+# read in from 1/1/19 to 19/10/23
+suppressMessages(data <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/All Data - DAM & IDA1.xlsx", sheet="DA", col_names = TRUE)[1:37728,c(13,5,6,14,15)])
+colnames(data) <- c('DateTime', 'PriceDAM', 'VolDAM', 'ForecastWind', 'Gas')
+
+# decompose datetime
+data$DateTime <- as.POSIXct(data$DateTime, format = "%d/%m/%Y %H:%M:%S", tz = "UTC")
+data$Day <- day(data$DateTime)
+data$Month <- month(data$DateTime)
+data$Year <- year(data$DateTime)
+data$Hour <- hour(data$DateTime)
+data$Quarter <- quarter(data$DateTime)
+data$Semester <- lubridate::semester(data$DateTime)
+data$DOW <- lubridate::wday(data$DateTime, week_start = 1)
+
+# arrange columns
+data <- data[, c('DateTime', 'Day', 'Month', 'Year', 'Hour', 'Quarter', 'Semester', 'DOW', 'Gas', 'ForecastWind', 'PriceDAM', 'VolDAM')]
+
+# sanity check for errors
+summary(data)
+data <- data[!is.na(data$DateTime),] # NAs in clocks going forward and early wind data 
+
+# zero volume in dam is unexpected - change to NAs for imputation
+data$VolDAM[data$VolDAM==0] <- NA
+
+# Use STINE Interpolation as best for ts data as per Denhard et al (2021)
+data$VolDAM <- na_interpolation(x = data$VolDAM, option = "stine")
+data$ForecastWind <- na_interpolation(x = data$ForecastWind, option = "stine")
+
+# KNN imputation from 'credit model' package
+# data$VolDAM <- knn_nas_imp(dat = data, x = 'VolDAM', k = 24, method = "avg_dist") %>% unlist() %>%  as.vector()
+# data$ForecastWind <- knn_nas_imp(dat = data, x = 'ForecastWind', k = 24, method = "avg_dist") %>% unlist() %>%  as.vector()
+
+# categorical predictors
+for (column in c('Day', 'Month', 'Year', 'Hour', 'Quarter', 'Semester', 'DOW')) {
+  data[[column]] <- data[[column]] %>% as.factor()
+}; rm(column)
+
+# Add tech indicators to data frame (TTR package)
+data$RSI <- RSI(data$PriceDAM, n = 24)
+data$MOM <- momentum(data$PriceDAM, n=24)
+data$EMA <- EMA(data$PriceDAM, n = 24)
+data$SMA <- SMA(data$PriceDAM, n = 24)
+
+# lag VolDAM and Gas and Technical Indicators (1day, 2days, 3days)
+for (i in c(24, 48, 72)) {
+  for (name in c('Gas', 'ForecastWind', 'PriceDAM', 'VolDAM', 'RSI', 'MOM', 'EMA', 'SMA')) {
+    column_name <- paste0(name, "_lag", i, "h")
+    data[[column_name]] <- lag(data[[name]], n = i)
+  }
+}; rm(column_name, i, name)
+
+# remove vars we won't know the day of
+data <- suppressWarnings(data[, !colnames(data) %in% c('RSI', 'MOM', 'EMA', 'SMA', 'Gas', 'VolDAM')])
+data <- data[97:nrow(data),]
+sum(is.na(data))
+
+# at this stage, all data contained in 'data' is in the correct format
+
+# back up data variable
+data2 <- data
+```
+
+```{r selecting num vars if correlated with each other}
+
+# index vectors of num vars
+numericVars <- which(sapply(data, is.numeric))
+
+# index vector of categ vars
+factorVars <- which(sapply(data, is.factor))
+
+# list of num and categ variables
+numericVarNames <- colnames(data[numericVars])
+DFnumeric <- data[, names(data) %in% numericVarNames & names(data) %in% c('PriceDAM')]
+DFcategorical <- data[, !names(data) %in% numericVarNames]
+
+# correlation of predictors
+cor.dam <- cor(data[, numericVars], use="pairwise.complete.obs") #correlations of all numeric variables
+cor_sorted <- as.matrix(sort(cor.dam[,'PriceDAM'], decreasing = TRUE))
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.0000000002)))
+cor.dam <- cor.dam[CorHigh, CorHigh]
+rm(numericVars, numericVarNames, factorVars, CorHigh, cor_sorted)
+corrplot.mixed(cor.dam, tl.col="black", tl.pos = "lt", number.cex = 0.75)
+```
+
+```{r check correlation among variables}
+
+# for highly correlated predictor variables, remove the one that correlates least strongly with PriceDAM if needed:
+data <- data[, !colnames(data) %in% c('VolDAM_lag48h', 'VolDAM_lag72h')]
+```
+
+```{r split data into train and test (hold out) subsets}
+# training data will contain 2019-2022
+data.dam.train <- data[1:30624,]
+
+# testing data will contain 2023 up to 14-0ct-23
+data.dam.test <- data[30625:37512,]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) + (24*5) == nrow(data)
+
+# prepare data sets
+X_train <- select(data.dam.train, -c(PriceDAM)) %>% as.data.frame()
+y_train <- select(data.dam.train, PriceDAM) %>% unlist() %>% as.vector()
+
+X_test <- select(data.dam.test, -c(PriceDAM)) %>% as.data.frame()
+y_test <- select(data.dam.test, PriceDAM) %>% unlist() %>% as.vector()
+
+train_sparse <- sparse.model.matrix(y_train ~., data = X_train)
+test_sparse <- sparse.model.matrix(y_test ~., data = X_test)
+
+data.dam.train <- xgb.DMatrix(data = train_sparse, label = y_train)
+data.dam.test <- xgb.DMatrix(data = test_sparse, label = y_test)
+```
+
+```{r cross validation}
+
+# set seed for reproducibility
+set.seed(28)
+
+# run cross-val model
+cv.dam <- xgb.cv(data = data.dam.train, 
+            label = y_train,
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+nrounds.dam <- which.min(cv.dam$evaluation_log$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = data.dam.train, 
+                 label = y_train,
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- colnames(data.dam.train), model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam[1:10])
+
+# apply to test (hold out) data - 2023 in this case
+preds <- predict(model.dam, data.dam.test)
+
+model.dam$evaluation_log$train_rmse[nrounds.dam]
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data)-(24*5))], "Predicted" = preds, "RMSE" = model.dam$evaluation_log$train_rmse[nrounds.dam])
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv9/Predict 2023 - Stine Interpolation.csv")
+
+#xgb.save(model.dam, 'DAMv9 model - high corrs removed')
+
+```
+
+```{r retrain 2019-2023 and predict 2023+1day 15oct23}
+
+# training data will contain everything up to 14-oct-23
+data.dam.train <- data[1:37512,]
+
+# testing data will contain 15-0ct-23
+data.dam.test <- data[(nrow(data.dam.train)+1):(nrow(data.dam.train)+24),]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) + (24*4) == nrow(data)
+
+# prepare data sets
+X_train <- select(data.dam.train, -c(PriceDAM)) %>% as.data.frame()
+y_train <- select(data.dam.train, PriceDAM) %>% unlist() %>% as.vector()
+
+X_test <- select(data.dam.test, -c(PriceDAM)) %>% as.data.frame()
+y_test <- select(data.dam.test, PriceDAM) %>% unlist() %>% as.vector()
+
+train_sparse <- sparse.model.matrix(y_train ~., data = X_train)
+test_sparse <- sparse.model.matrix(y_test ~., data = X_test)
+
+data.dam.train <- xgb.DMatrix(data = train_sparse, label = y_train)
+data.dam.test <- xgb.DMatrix(data = test_sparse, label = y_test)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.dam <- xgb.cv(data = data.dam.train,
+            label = y_train,
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+nrounds.dam <- which.min(cv.dam$evaluation_log$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = data.dam.train, 
+                 label = y_train,
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- colnames(data.dam.train), model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam[1:10])
+
+# apply to test (hold out) data - 2023 in this case
+preds <- predict(model.dam, data.dam.test)
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data)-(24*4))], "Predicted" = preds)
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv9/DAMv9 Predict 15102023 Stine Interpolation.csv")
+
+```
+
+```{r retrain 2019-2023 and predict 2023+1day 16oct23}
+
+# training data will contain everything up to 15-oct-23
+data.dam.train <- data[1:37536,]
+
+# testing data will contain 16-0ct-23
+data.dam.test <- data[(nrow(data.dam.train)+1):(nrow(data.dam.train)+24),]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) + (24*3) == nrow(data)
+
+# prepare data sets
+X_train <- select(data.dam.train, -c(PriceDAM)) %>% as.data.frame()
+y_train <- select(data.dam.train, PriceDAM) %>% unlist() %>% as.vector()
+
+X_test <- select(data.dam.test, -c(PriceDAM)) %>% as.data.frame()
+y_test <- select(data.dam.test, PriceDAM) %>% unlist() %>% as.vector()
+
+train_sparse <- sparse.model.matrix(y_train ~., data = X_train)
+test_sparse <- sparse.model.matrix(y_test ~., data = X_test)
+
+data.dam.train <- xgb.DMatrix(data = train_sparse, label = y_train)
+data.dam.test <- xgb.DMatrix(data = test_sparse, label = y_test)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.dam <- xgb.cv(data = data.dam.train,
+            label = y_train,
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+nrounds.dam <- which.min(cv.dam$evaluation_log$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = data.dam.train, 
+                 label = y_train,
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- colnames(data.dam.train), model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam[1:10])
+
+# apply to test (hold out) data - 2023 in this case
+preds <- predict(model.dam, data.dam.test)
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data)-(24*3))], "Predicted" = preds)
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv9/DAMv9 Predict 16102023 High Corr Vars Removed CV Retrained.csv")
+
+# ```
+# 
+# ```{r retrain 2019-2023 and predict 2023+1day 17oct23}
+
+# training data will contain everything up to 16-oct-23
+data.dam.train <- data[1:37560,]
+
+# testing data will contain 17-0ct-23
+data.dam.test <- data[(nrow(data.dam.train)+1):(nrow(data.dam.train)+24),]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) + (24*2) == nrow(data)
+
+# prepare data sets
+X_train <- select(data.dam.train, -c(PriceDAM)) %>% as.data.frame()
+y_train <- select(data.dam.train, PriceDAM) %>% unlist() %>% as.vector()
+
+X_test <- select(data.dam.test, -c(PriceDAM)) %>% as.data.frame()
+y_test <- select(data.dam.test, PriceDAM) %>% unlist() %>% as.vector()
+
+train_sparse <- sparse.model.matrix(y_train ~., data = X_train)
+test_sparse <- sparse.model.matrix(y_test ~., data = X_test)
+
+data.dam.train <- xgb.DMatrix(data = train_sparse, label = y_train)
+data.dam.test <- xgb.DMatrix(data = test_sparse, label = y_test)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.dam <- xgb.cv(data = data.dam.train,
+            label = y_train,
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+ 
+nrounds.dam <- which.min(cv.dam$evaluation_log$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = data.dam.train, 
+                 label = y_train,
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- colnames(data.dam.train), model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam[1:10])
+
+# apply to test (hold out) data - 2023 in this case
+preds <- predict(model.dam, data.dam.test)
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data)-(24*2))], "Predicted" = preds)
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv9/DAMv9 Predict 17102023 High Corr Vars Removed CV Retrained.csv")
+
+# ```
+# 
+# ```{r retrain 2019-2023 and predict 2023+1day 18oct23}
+
+# training data will contain everything up to 17-oct-23
+data.dam.train <- data[1:37584,]
+
+# testing data will contain 18-0ct-23
+data.dam.test <- data[(nrow(data.dam.train)+1):(nrow(data.dam.train)+24),]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) + (24*1) == nrow(data)
+
+# prepare data sets
+X_train <- select(data.dam.train, -c(PriceDAM)) %>% as.data.frame()
+y_train <- select(data.dam.train, PriceDAM) %>% unlist() %>% as.vector()
+
+X_test <- select(data.dam.test, -c(PriceDAM)) %>% as.data.frame()
+y_test <- select(data.dam.test, PriceDAM) %>% unlist() %>% as.vector()
+
+train_sparse <- sparse.model.matrix(y_train ~., data = X_train)
+test_sparse <- sparse.model.matrix(y_test ~., data = X_test)
+
+data.dam.train <- xgb.DMatrix(data = train_sparse, label = y_train)
+data.dam.test <- xgb.DMatrix(data = test_sparse, label = y_test)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.dam <- xgb.cv(data = data.dam.train,
+            label = y_train,
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+elog.dam <- cv.dam$evaluation_log # error logs
+nrounds.dam <- which.min(elog.dam$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = data.dam.train, 
+                 label = y_train,
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- colnames(data.dam.train), model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam[1:10])
+
+# apply to test (hold out) data - 2023 in this case
+preds <- predict(model.dam, data.dam.test)
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data)-(24*1))], "Predicted" = preds)
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv9/DAMv9 Predict 18102023 High Corr Vars Removed CV Retrained.csv")
+
+# ```
+# 
+# ```{r retrain 2019-2023 and predict 2023+1day 19oct23}
+
+# training data will contain everything up to 18-oct-23
+data.dam.train <- data[1:37608,]
+
+# testing data will contain 19-0ct-23
+data.dam.test <- data[(nrow(data.dam.train)+1):(nrow(data.dam.train)+24),]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) == nrow(data)
+
+# prepare data sets
+X_train <- select(data.dam.train, -c(PriceDAM)) %>% as.data.frame()
+y_train <- select(data.dam.train, PriceDAM) %>% unlist() %>% as.vector()
+
+X_test <- select(data.dam.test, -c(PriceDAM)) %>% as.data.frame()
+y_test <- select(data.dam.test, PriceDAM) %>% unlist() %>% as.vector()
+
+train_sparse <- sparse.model.matrix(y_train ~., data = X_train)
+test_sparse <- sparse.model.matrix(y_test ~., data = X_test)
+
+data.dam.train <- xgb.DMatrix(data = train_sparse, label = y_train)
+data.dam.test <- xgb.DMatrix(data = test_sparse, label = y_test)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.dam <- xgb.cv(data = data.dam.train,
+            label = y_train,
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+elog.dam <- cv.dam$evaluation_log # error logs
+nrounds.dam <- which.min(elog.dam$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = data.dam.train, 
+                 label = y_train,
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- colnames(data.dam.train), model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam[1:10])
+
+# apply to test (hold out) data - 2023 in this case
+preds <- predict(model.dam, data.dam.test)
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data)-(24*0))], "Predicted" = preds)
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv9/DAMv9 Predict 19102023 High Corr Vars Removed CV Retrained.csv")
+
+```

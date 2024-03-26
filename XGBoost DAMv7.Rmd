@@ -1,0 +1,194 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load required packages
+requiredpackages <- c("caret", "data.table", "digest", "dplyr", "forecastHybrid", "ggplot2", "Hmisc", "magrittr", "rapport", "readxl", "stringr", "tidyverse", "vtreat", "xgboost", "zoo")
+
+install_load <- function(packages){
+     for (p in packages) {
+          if (p %in% rownames(installed.packages())) {
+               library(p, character.only=TRUE)
+          } else {
+               install.packages(p)
+               library(p,character.only = TRUE)
+          }
+     }
+}
+suppressMessages(install_load(requiredpackages))
+rm(requiredpackages, install_load)
+```
+
+```{r Import data for dam}
+
+# read in to 15/10/23
+suppressMessages(data <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/All Data - DAM & IDA1.xlsx", sheet="DA", col_names = TRUE)[1:37632,c(1,3:11,14:16)])
+colnames(data) <- c('Year', 'Month', 'Hour', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'ForecastWind', 'Gas', 'IC_All')
+
+# arrange columns; remove volume bought in DAM and Interconnector data because we won't know these the day of
+data <- data[, c('Year', 'Month', 'DOM', 'Hour', 'DOY', 'DOW', 'WOY', 'Quarter', 'Gas', 'ForecastWind', 'PriceDAM')]
+
+# sanity check for NAs
+summary(data) # NAs only in wind data
+
+# impute knn for forecast wind
+data$ForecastWind <- with(data, impute(data$ForecastWind))
+
+# imputed rows have changed type - revert
+forecast_wind_values <- as.numeric(data$ForecastWind)
+data$ForecastWind <- forecast_wind_values
+rm(forecast_wind_values)
+
+# sanity check subset
+summary(data)
+```
+
+```{r split data df into separate dfs}
+
+# take last week of data and store in a separate df for later testing model on unseen data
+data.dam.unseen <- data[(nrow(data)-(7*24)+1):nrow(data),]
+
+# keep everything else in data.dam df
+data.dam <- data[1:(nrow(data)-nrow(data.dam.unseen)),]
+
+# sanity check
+nrow(data) == nrow(data.dam) + nrow(data.dam.unseen)
+```
+
+```{r rolling window cross validation - manual formation}
+
+# Set the rolling window size
+window_size <- 1680
+
+# Create count variable
+counter <- 0
+
+# Store results from cv in list
+model.dam.results <- list()
+
+# Loop
+for (i in 1:floor((nrow(data.dam)/window_size))) {
+  
+  counter <- counter + 1
+  
+  # split train and test
+  data.dam.train <- data.dam[1:(i*window_size), ]
+  data.dam.test <- anti_join(data.dam, data.dam.train)
+  
+  # labels for xgb are the values of the target variable
+  labels.dam <- data.dam.test$PriceDAM
+  
+  # separate features and labels
+  data.dam.test <- select(data.dam.test, -c(PriceDAM))
+  
+  # extract variable names without outcome variable
+  vars.dam <- colnames(data.dam.test)
+  
+  # use vtreat to design variable 'treatments' with no outcome variable
+  train.dam <- designTreatmentsZ(data.dam.train, vars.dam)
+  newvars.dam <-  train.dam$scoreFrame %>%
+    filter(code %in% c("clean", "lev")) %>%
+    use_series(varName)
+  
+  # prepare data.ida1 with the required vars
+  data.dam.train <- prepare(train.dam, data.dam.train, varRestriction = newvars.dam)
+  
+  # Run model and store results in list
+  model.dam.results[[paste("model.dam_", counter, sep="")]] <- xgboost(data = as.matrix(data.dam.train), 
+                                                                       label = labels.dam[1:nrow(data.dam.train)],
+                                                                       nrounds = 300,
+                                                                       objective = "reg:squarederror",
+                                                                       eta = 0.05, #optimum$eta,
+                                                                       max_depth = 9, #optimum$max_depth,
+                                                                       verbose = TRUE,
+                                                                       print_every_n = 100,
+                                                                       early_stopping_rounds = 2)
+}
+```
+
+```{r XGBOOST MODEL - cross validation - depth}
+
+#create a list for results
+cv.dam.results <- list()
+train.rmse.dam <- c()
+test.rmse.dam <- c()
+
+# train cv models for different depths
+for (i in 1:25) {
+  cv.dam.results[[paste("cv.dam_", i, sep="")]] <- xgb.cv(data = as.matrix(data.dam.train), 
+              label = labels.dam[1:nrow(data.dam.train)],
+              nrounds = 5000,
+              nfold = 3,
+              objective = "reg:squarederror",
+              eta = 0.05,
+              max_depth = i,
+              early_stopping_rounds = 2,
+              verbose = TRUE, # can change to false when happy with model tuning
+              print_every_n = 100)
+}
+
+for (i in 1:25) {
+  train.rmse.dam <- append(train.rmse.dam, min(cv.dam.results[[paste("cv.dam_", i, sep="")]]$evaluation_log$train_rmse_mean))
+  test.rmse.dam <- append(test.rmse.dam, min(cv.dam.results[[paste("cv.dam_", i, sep="")]]$evaluation_log$test_rmse_mean))
+}
+```
+
+```{r plot RMSE at different depths}
+RMSE.dam <- cbind(train.rmse.dam, test.rmse.dam)
+colnames(RMSE.dam) <- c("Train", "Test")
+
+ggplot(data = as.data.frame(RMSE.dam), aes(x = 1:25, y = RMSE.dam)) +
+  geom_line(aes(y = Train, color = "Train")) +
+  geom_line(aes(y = Test, color = "Test")) +
+  labs(x = "Max_depths", y = "RMSE", title = "RMSE Scores at different XGB Depths for DAM", caption = "eta = 0.05, nfold = 3, early stopping = 2") +
+  scale_x_continuous(breaks = seq(1, 25, by = 1), minor_breaks = seq(1, 25, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 25, by = 1), minor_breaks = seq(0, 25, by = 0.5))
+
+ggsave("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Graphs/DAM/RMSEs at Different Depths (DAM).png", last_plot(), width = 12, height = 8, dpi = 1000)
+
+# best depth for test data appears to be max_depth = 10
+```
+
+```{r XGBOOST MODEL - cross validation - eta}
+
+#create a list for results
+cv.dam.results <- list()
+train.rmse.dam <- c()
+test.rmse.dam <- c()
+
+# train cv models for different depths
+for (i in seq(0.01, 0.1, by = 0.01)) {
+  cv.dam.results[[paste("cv.dam_", i, sep="")]] <- xgb.cv(data = as.matrix(data.dam.train), 
+              label = labels.dam[1:nrow(data.dam.train)],
+              nrounds = 5000,
+              nfold = 3,
+              objective = "reg:squarederror",
+              eta = i,
+              max_depth = 10,
+              early_stopping_rounds = 2,
+              verbose = TRUE, # can change to false when happy with model tuning
+              print_every_n = 100)
+
+  train.rmse.dam <- append(train.rmse.dam, min(cv.dam.results[[paste("cv.dam_", i, sep="")]]$evaluation_log$train_rmse_mean))
+  test.rmse.dam <- append(test.rmse.dam, min(cv.dam.results[[paste("cv.dam_", i, sep="")]]$evaluation_log$test_rmse_mean))
+}
+```
+
+```{r plot RMSE at different depths}
+RMSE.dam <- cbind(train.rmse.dam, test.rmse.dam)
+colnames(RMSE.dam) <- c("Train", "Test")
+
+ggplot(data = as.data.frame(RMSE.dam), aes(x = 1:length(train.rmse.dam), y = RMSE.dam)) +
+  geom_line(aes(y = Train, color = "Train")) +
+  geom_line(aes(y = Test, color = "Test")) +
+  labs(x = "Learning Rate", y = "RMSE", title = "RMSE Scores at different XGB Learning Rates for DAM", caption = "depth = 10, nfold = 3, early stopping = 2 (NB: etas are 0.1 to 1.0 by 0.1") +
+  scale_x_continuous(breaks = seq(0.01, 0.1, by = 1)) +
+  scale_y_continuous(breaks = seq(0, 25, by = 5), minor_breaks = seq(0, 25, by = 1))
+
+ggsave("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Graphs/DAM/Etas at Different Depths (DAM).png", last_plot(), width = 12, height = 8, dpi = 1000)
+
+# best learning rate for test data appears to be eta = 0.1
+# test rmse only got worse as train rmse imporoved/maintained so will redo with smaller etas
+# etas are still very poor for test omapred to train; unsure
+```

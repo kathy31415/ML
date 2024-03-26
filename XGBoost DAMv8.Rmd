@@ -1,0 +1,645 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r pkgs}
+# Load required packages
+requiredpackages <- c("creditmodel", "caret", "corrplot", "data.table", "digest", "dplyr", "ggplot2", "gridExtra", "Hmisc", "magrittr", "plyr", "psych", "rapport", "readxl", "stringr", "tidyverse", "vtreat", "xgboost", "zoo")
+
+install_load <- function(packages){
+     for (p in packages) {
+          if (p %in% rownames(installed.packages())) {
+               library(p, character.only=TRUE)
+          } else {
+               install.packages(p)
+               library(p,character.only = TRUE)
+          }
+     }
+}
+suppressMessages(install_load(requiredpackages))
+rm(requiredpackages, install_load)
+```
+
+```{r Tech Ind functions}
+#Create technical indicator functions
+
+#Price momentum MOM
+mymom <- function(price, n) {
+  mom <- rep(0, length(price))
+  N <- length(price)
+  for (i in (n + 1):(N-n)) {
+    mom[i] <- price[i] - price[i - n]
+  }
+  return(mom)
+}
+
+#Percentage Range PR
+mypr <- function (price,n){
+  pr <- c()
+  pr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- ((max(price[(i-n):i])))
+    min.temp <- ((min(price[(i-n):i])))
+    price.temp <- price[i]
+    numerator <- max.temp - price.temp
+    denominator <- max.temp - min.temp
+    pr[i] <- 100 * (numerator / denominator)
+  }
+  return(pr)
+}
+
+#Absolute True Range ATR
+myatr <- function (price,n){
+  atr <- c()
+  tr <- c()
+  atr[1:(n-1)] <- NA
+  tr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- max(price[(i-n+1):i])
+    min.temp <- min(price[(i-n+1):i])
+    price.temp <- price[i]
+    A.temp <- max.temp - min.temp
+    B.temp <- abs(max.temp - price.temp)
+    C.temp <- abs(min.temp - price.temp)
+    TR.temp <- max(c(A.temp, B.temp, C.temp))
+    tr[i] <- TR.temp
+    atr[i] <- sum(tr[(i-n+1):i])
+  }
+  return(atr)
+}
+
+#Average Directional Movement Index ADX
+myadx <- function(price, n) {
+  adx <- numeric(length(price))
+  priceup <- numeric(length(price))
+  pricedown <- numeric(length(price))
+  adx[1:(n-1)] <- NA
+  priceup[1:(n-1)] <- NA
+  pricedown[1:(n-1)] <- NA
+  for (i in n:length(price)) {
+    if (!is.na(price[i]) && !is.na(price[(i-n+1)]) && price[i] - price[(i-n+1)] > 0) {
+      priceup[i] <- price[i] - price[(i-n+1)]
+    } else {
+      pricedown[i] <- price[i] - price[(i-n+1)]
+    }
+    positiveDM <- sum(priceup[(i-n+1):i], na.rm = TRUE)
+    negativeDM <- -sum(pricedown[(i-n+1):i], na.rm = TRUE)
+    tr <- sum(abs(diff(price[(i-n+1):(i+1)])), na.rm = TRUE)
+    plusDI <- (positiveDM / tr) * 100
+    minusDI <- (negativeDM / tr) * 100
+    adx[i] <- (abs(plusDI - minusDI) / (plusDI + minusDI)) * 100
+  }
+  return(adx)
+}
+
+#Relative Strength index RSI
+calculate_RSIs <- function(price, s) {
+  n <- length(price)
+  up <- numeric(n)
+  down <- numeric(n)
+  up[1] <- 0
+  down[1] <- 0
+  
+  for (i in 2:n) {
+    diff_price <- price[i] - price[i - 1]
+    if (!is.na(diff_price) && diff_price > 0) {
+      up[i] <- diff_price
+      down[i] <- 0
+    } else if (!is.na(diff_price) && diff_price < 0) {
+      up[i] <- 0
+      down[i] <- abs(diff_price)
+    } else {
+      up[i] <- 0
+      down[i] <- 0
+    }
+  }
+  
+  avg_up <- rollapply(up, width = s, FUN = mean, align = "right", fill = NA)
+  avg_down <- rollapply(down, width = s, FUN = mean, align = "right", fill = NA)
+  
+  RS <- avg_up / avg_down
+  RSI <- 100 - (100 / (1 + RS))
+  
+  return(as.vector(as.numeric(RSI)))
+}
+
+#Mean Absolute Convergence/Divergence MACD
+calculate_MACD <- function(price, a, b) {
+  ma_a <- stats::filter(price, rep(1/a, a), sides = 1)
+  ma_b <- stats::filter(price, rep(1/b, b), sides = 1)
+  macd <- ma_a - ma_b
+  
+  return(as.numeric(macd))
+}
+```
+
+```{r Import data for dam}
+
+# read in from 1/1/19 to 19/10/23
+suppressMessages(data <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/All Data - DAM & IDA1.xlsx", sheet="DA", col_names = TRUE)[1:37728,c(1,3:11,14,15)])
+colnames(data) <- c('Year', 'Month', 'Hour', 'PriceDAM', 'VolDAM', 'DOY', 'DOM', 'DOW', 'WOY', 'Quarter', 'ForecastWind', 'Gas')
+
+# arrange columns
+data <- data[, c('Year', 'Month', 'DOM', 'Hour', 'DOY', 'DOW', 'WOY', 'Quarter', 'Gas', 'ForecastWind', 'PriceDAM', 'VolDAM')]
+
+# sanity check for errors
+summary(data) # NAs in early wind data
+
+# zero volume in dam is unexpected - change to NAs for imputation
+data$VolDAM[data$VolDAM==0] <- NA
+
+# KNN imputation from 'credit model' package
+data$VolDAM <- knn_nas_imp(dat = data, x = 'VolDAM', k = 24, method = "avg_dist") %>% unlist() %>%  as.vector()
+data$ForecastWind <- knn_nas_imp(dat = data, x = 'ForecastWind', k = 24, method = "avg_dist") %>% unlist() %>%  as.vector()
+
+# categorical predictors
+data$Year <- as.factor(data$Year)
+data$Month <- as.factor(data$Month)
+data$DOM <- as.factor(data$DOM)
+data$Hour <- as.factor(data$Hour)
+data$WOY <- as.factor(data$WOY)
+data$Quarter <- as.factor(data$Quarter)
+#data$Weekend <- c()
+#data$Weekend <- for (i in 1:nrow(data)) {if (data$DOW[i] > 5) {data$Weekend[i] <- 'Yes'} else {data$Weekend[i] <- 'No'}}
+data$DOW <- as.factor(data$DOW)
+
+# Add tech indicators to data frame
+data$MACD <- data$PriceDAM %>% calculate_MACD(12, 24)
+data$RSI <- data$PriceDAM %>% calculate_RSIs(24)
+data$ADX <- data$PriceDAM %>% myadx(24)
+data$ATR <- data$PriceDAM %>% myatr(24)
+data$MOM <- data$PriceDAM %>% mymom(24)
+data$PR <- data$PriceDAM %>% mypr(24)
+
+# lag VolDAM and Gas and Technical Indicators
+for (i in c(24, 48, 168)) {
+  for (name in c("VolDAM", "Gas", 'MACD', 'RSI', 'ADX', 'ATR', 'MOM', 'PR')) {
+    column_name <- paste0(name, "_lag", i, "h")
+    data[[column_name]] <- lag(data[[name]], n = i)
+  }
+}
+
+rm(column_name, i, name)
+data <- data[215:nrow(data),]
+
+# at this stage, all data contained in 'data' is in the correct format
+
+# back up data variable
+data2 <- data
+summary(data)
+
+```
+
+```{r selecting num vars if correlated with each other}
+
+suppressWarnings(data <- data[, !colnames(data) %in% c('Gas', 'VolDAM', 'ATR', 'MOM', 'RSI', 'MACD', 'PR', 'ADX')])
+
+# index vectors of num vars
+numericVars <- which(sapply(data, is.numeric))
+
+# index vector of categ vars
+factorVars <- which(sapply(data, is.factor))
+
+# list of num and categ variables
+numericVarNames <- colnames(data[numericVars])
+DFnumeric <- data[, names(data) %in% numericVarNames & names(data) %in% c('PriceDAM')]
+DFcategorical <- data[, !names(data) %in% numericVarNames]
+
+# correlation of predictors
+cor.dam <- cor(data[, numericVars], use="pairwise.complete.obs") #correlations of all numeric variables
+cor_sorted <- as.matrix(sort(cor.dam[,'PriceDAM'], decreasing = TRUE))
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.0000000002)))
+cor.dam <- cor.dam[CorHigh, CorHigh]
+rm(numericVars, numericVarNames, factorVars, CorHigh, cor_sorted)
+corrplot.mixed(cor.dam, tl.col="black", tl.pos = "lt")
+
+# for highly correlated predictor variables, remove the one that correlates least strongly with PriceDAM if needed:
+#data <- data[, !colnames(data) %in% c('VolDAM_lag48h', 'MOM_lag24h', 'MOM_lag168h', 'RSI_lag48h', 'ATR_lag48h')]
+```
+
+```{r skewed response variable}
+
+skew(data$PriceDAM) # skew value of 1.37 indicates a right skew that is too high
+qqnorm(data$PriceDAM) # shows that prices are not normally distributed
+hist(data$PriceDAM)
+# data are slightly right-skewed but get worse with transformations so leave as it
+
+# cube root transformation
+crt <- data$PriceDAM ^ (1/3)
+hist(crt)
+qqnorm(crt)
+```
+
+```{r split data into train and test (hold out) subsets}
+
+# training data will contain 2019-2022
+data.dam.train <- data[1:30506,]
+
+# testing data will contain 2023 up to 14-0ct-23
+data.dam.test <- data[30507:37394,]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) + (24*5) == nrow(data)
+
+# remove outcome var from test dataset
+data.dam.test <- select(data.dam.test, -c(PriceDAM))
+
+# labels for xgb are the values of the target variable
+labels.dam <- data$PriceDAM
+
+# extract variable names without outcome variable
+vars.dam <- colnames(data.dam.test)
+
+# use vtreat to design variable 'treatments' with no outcome variable
+train.dam <- designTreatmentsZ(data.dam.train, vars.dam)
+newvars.dam <-  train.dam$scoreFrame %>%
+  filter(code %in% c("clean", "lev")) %>%
+  use_series(varName)
+
+# prepare data.dam with the required vars
+data.dam.train <- prepare(train.dam, data.dam.train, varRestriction = newvars.dam)
+
+# set seed for reproducibility
+set.seed(28)
+# run cross-val model
+cv.dam <- xgb.cv(data = as.matrix(data.dam.train), 
+            label = labels.dam[1:nrow(data.dam.train)],
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+nrounds.dam <- which.min(cv.dam$evaluation_log$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = as.matrix(data.dam.train), 
+                 label = labels.dam[1:nrow(data.dam.train)],
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- newvars.dam, model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam)
+
+# apply to test (hold out) data - 2023 in this case
+data.dam.test <- prepare(train.dam, data.dam.test, varRestriction = newvars.dam)
+data.dam.test$pred <- predict(model.dam, as.matrix(data.dam.test))
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data)-(24*5))], "Predicted" = data.dam.test$pred)
+
+#write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/MAE Model.csv")
+
+```
+
+```{r retrain 2019-2023 and predict 2023+1day 15oct23}
+
+# training data will contain 2019-2023 this time (up to and incl 14-oct-23)
+data.dam.train <- data[1:37394,]
+
+# hold out data will contain the +1 day (15-oct-23)
+data.dam.test <- data[37395:(nrow(data.dam.train)+24),]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) + (24*4) == nrow(data)
+
+# remove outcome vars from test dataset
+data.dam.test <- select(data.dam.test, -c(PriceDAM))
+
+# extract variable names without outcome variable
+vars.dam <- colnames(data.dam.test)
+
+# use vtreat to design variable 'treatments' with no outcome variable
+train.dam <- designTreatmentsZ(data.dam.train, vars.dam)
+newvars.dam <-  train.dam$scoreFrame %>%
+  filter(code %in% c("clean", "lev")) %>%
+  use_series(varName)
+
+# prepare data.dam with the required vars
+data.dam.train <- prepare(train.dam, data.dam.train, varRestriction = newvars.dam)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+# cv.dam <- xgb.cv(data = as.matrix(data.dam.train),
+#             label = labels.dam[1:nrow(data.dam.train)],
+#             nrounds = 5000,
+#             nfold = 5,
+#             objective = "reg:squarederror",
+#             eta = 0.1,
+#             max_depth = 10,
+#             early_stopping_rounds = 1,
+#             verbose = TRUE, # can change to false when happy with model tuning
+#             print_every_n = 100)
+# 
+# elog.dam <- cv.dam$evaluation_log # error logs
+# nrounds.dam <- which.min(elog.dam$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = as.matrix(data.dam.train), 
+                 label = labels.dam[1:nrow(data.dam.train)],
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- newvars.dam, model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam)
+
+# apply to test (hold out) data
+data.dam.test <- prepare(train.dam, data.dam.test, varRestriction = newvars.dam)
+data.dam.test$pred <- predict(model.dam, as.matrix(data.dam.test))
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data.dam.train)+24)], "Predicted" = data.dam.test$pred, "Date" = paste0(data.dam.test$DOM," ",data.dam.test$Month," ",data.dam.test$Year," ",data.dam.test$Hour))
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv8/DAMv8 - DAM Predict 151023 lagged Gas VolDAM and TIs with retraining cv First Iteration.csv")
+
+```
+
+```{r retrain 2019-2023 and predict +1day 16oct23}
+
+# training data will contain 2019-2023 this time (up to and incl 15-oct-23)
+data.dam.train <- data[1:37418,]
+
+# hold out data will contain the +1 day (16-oct-23)
+data.dam.test <- data[37419:(nrow(data.dam.train)+24),]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) + (24*3) == nrow(data)
+
+# remove outcome vars from test dataset
+data.dam.test <- select(data.dam.test, -c(PriceDAM))
+
+# extract variable names without outcome variable
+vars.dam <- colnames(data.dam.test)
+
+# use vtreat to design variable 'treatments' with no outcome variable
+train.dam <- designTreatmentsZ(data.dam.train, vars.dam)
+newvars.dam <-  train.dam$scoreFrame %>%
+  filter(code %in% c("clean", "lev")) %>%
+  use_series(varName)
+
+# prepare data.dam with the required vars
+data.dam.train <- prepare(train.dam, data.dam.train, varRestriction = newvars.dam)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.dam <- xgb.cv(data = as.matrix(data.dam.train),
+            label = labels.dam[1:nrow(data.dam.train)],
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+elog.dam <- cv.dam$evaluation_log # error logs
+nrounds.dam <- which.min(elog.dam$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = as.matrix(data.dam.train), 
+                 label = labels.dam[1:nrow(data.dam.train)],
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- newvars.dam, model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam)
+
+# apply to test (hold out) data
+data.dam.test <- prepare(train.dam, data.dam.test, varRestriction = newvars.dam)
+data.dam.test$pred <- predict(model.dam, as.matrix(data.dam.test))
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data.dam.train)+24)], "Predicted" = data.dam.test$pred, "Date" = paste0(data.dam.test$DOM," ",data.dam.test$Month," ",data.dam.test$Year," ",data.dam.test$Hour))
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv8/DAMv8 - DAM Predict 161023 lagged Gas VolDAM and TIs with retraining cv Noughth Iteration.csv")
+
+```
+
+```{r retrain 2019-2023 and predict +1day 17oct23}
+
+# training data will contain 2019-2023 this time (up to and incl 16-oct-23)
+data.dam.train <- data[1:37608,]
+
+# hold out data will contain the +1 day (17-oct-23)
+data.dam.test <- data[37609:(nrow(data.dam.train)+24),]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) + (24*2) == nrow(data)
+
+# remove outcome vars from test dataset
+data.dam.test <- select(data.dam.test, -c(PriceDAM))
+
+# extract variable names without outcome variable
+vars.dam <- colnames(data.dam.test)
+
+# use vtreat to design variable 'treatments' with no outcome variable
+train.dam <- designTreatmentsZ(data.dam.train, vars.dam)
+newvars.dam <-  train.dam$scoreFrame %>%
+  filter(code %in% c("clean", "lev")) %>%
+  use_series(varName)
+
+# prepare data.dam with the required vars
+data.dam.train <- prepare(train.dam, data.dam.train, varRestriction = newvars.dam)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.dam <- xgb.cv(data = as.matrix(data.dam.train), 
+            label = labels.dam[1:nrow(data.dam.train)],
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+elog.dam <- cv.dam$evaluation_log # error logs
+nrounds.dam <- which.min(elog.dam$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = as.matrix(data.dam.train), 
+                 label = labels.dam[1:nrow(data.dam.train)],
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- newvars.dam, model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam)
+
+# apply to test (hold out) data
+data.dam.test <- prepare(train.dam, data.dam.test, varRestriction = newvars.dam)
+data.dam.test$pred <- predict(model.dam, as.matrix(data.dam.test))
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data.dam.train)+24)], "Predicted" = data.dam.test$pred, "Date" = paste0(data.dam.test$DOM," ",data.dam.test$Month," ",data.dam.test$Year," ",data.dam.test$Hour))
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv8 - DAM Predict 171023 temp.csv")
+
+# write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv8 - DAM Predict 161023 with Top 14 One Hot Coded Variables.csv")
+```
+
+```{r retrain 2019-2023 and predict +1day 18oct23}
+
+# training data will contain 2019-2023 this time (up to and incl 17-oct-23)
+data.dam.train <- data[1:37632,]
+
+# hold out data will contain the +1 day (18-oct-23)
+data.dam.test <- data[37633:(nrow(data.dam.train)+24),]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) + (24) == nrow(data)
+
+# remove outcome vars from test dataset
+data.dam.test <- select(data.dam.test, -c(PriceDAM))
+
+# extract variable names without outcome variable
+vars.dam <- colnames(data.dam.test)
+
+# use vtreat to design variable 'treatments' with no outcome variable
+train.dam <- designTreatmentsZ(data.dam.train, vars.dam)
+newvars.dam <-  train.dam$scoreFrame %>%
+  filter(code %in% c("clean", "lev")) %>%
+  use_series(varName)
+
+# prepare data.dam with the required vars
+data.dam.train <- prepare(train.dam, data.dam.train, varRestriction = newvars.dam)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.dam <- xgb.cv(data = as.matrix(data.dam.train), 
+            label = labels.dam[1:nrow(data.dam.train)],
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+elog.dam <- cv.dam$evaluation_log # error logs
+nrounds.dam <- which.min(elog.dam$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = as.matrix(data.dam.train), 
+                 label = labels.dam[1:nrow(data.dam.train)],
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- newvars.dam, model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam)
+
+# apply to test (hold out) data
+data.dam.test <- prepare(train.dam, data.dam.test, varRestriction = newvars.dam)
+data.dam.test$pred <- predict(model.dam, as.matrix(data.dam.test))
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data.dam.train)+24)], "Predicted" = data.dam.test$pred, "Date" = paste0(data.dam.test$DOM," ",data.dam.test$Month," ",data.dam.test$Year," ",data.dam.test$Hour))
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv8 - DAM Predict 181023 temp.csv")
+```
+
+```{r retrain 2019-2023 and predict +1day 19oct23}
+
+# training data will contain 2019-2023 this time (up to and incl 18-oct-23)
+data.dam.train <- data[1:37656,]
+
+# hold out data will contain the +1 day (19-oct-23)
+data.dam.test <- data[37657:(nrow(data.dam.train)+24),]
+
+# sanity check row numbers
+nrow(data.dam.train) + nrow(data.dam.test) == nrow(data)
+
+# remove outcome vars from test dataset
+data.dam.test <- select(data.dam.test, -c(PriceDAM))
+
+# extract variable names without outcome variable
+vars.dam <- colnames(data.dam.test)
+
+# use vtreat to design variable 'treatments' with no outcome variable
+train.dam <- designTreatmentsZ(data.dam.train, vars.dam)
+newvars.dam <-  train.dam$scoreFrame %>%
+  filter(code %in% c("clean", "lev")) %>%
+  use_series(varName)
+
+# prepare data.dam with the required vars
+data.dam.train <- prepare(train.dam, data.dam.train, varRestriction = newvars.dam)
+
+# set seed for reproducibility
+set.seed(400)
+
+# run cross-val model
+cv.dam <- xgb.cv(data = as.matrix(data.dam.train), 
+            label = labels.dam[1:nrow(data.dam.train)],
+            nrounds = 5000,
+            nfold = 5,
+            objective = "reg:squarederror",
+            eta = 0.1,
+            max_depth = 10,
+            early_stopping_rounds = 1,
+            verbose = TRUE, # can change to false when happy with model tuning
+            print_every_n = 100)
+
+elog.dam <- cv.dam$evaluation_log # error logs
+nrounds.dam <- which.min(elog.dam$test_rmse_mean) # out of sample error
+
+# xgb on train data with best nrounds to get final model
+model.dam <- xgboost(data = as.matrix(data.dam.train), 
+                 label = labels.dam[1:nrow(data.dam.train)],
+                 nrounds = nrounds.dam,
+                 objective = "reg:squarederror",
+                 eta = 0.1, #optimum$eta,
+                 max_depth = 10, #optimum$max_depth,
+                 verbose = TRUE,
+                 print_every_n = 100,
+                 early_stopping_rounds = 1)
+
+# Plot feature importance matrix
+importance.dam <- xgb.importance(feature_names <- newvars.dam, model = model.dam)
+xgb.ggplot.importance(importance_matrix = importance.dam)
+
+# apply to test (hold out) data
+data.dam.test <- prepare(train.dam, data.dam.test, varRestriction = newvars.dam)
+data.dam.test$pred <- predict(model.dam, as.matrix(data.dam.test))
+
+outcomes <- cbind("Actual" = data$PriceDAM[(nrow(data.dam.train)+1):(nrow(data.dam.train)+24)], "Predicted" = data.dam.test$pred, "Date" = paste0(data.dam.test$DOM," ",data.dam.test$Month," ",data.dam.test$Year," ",data.dam.test$Hour))
+
+write.csv(outcomes, "//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Output/DAMv8 - DAM Predict 191023 temp.csv")
+```

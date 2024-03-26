@@ -1,0 +1,512 @@
+---
+title: "XGBoost All Data"
+output: html_document
+date: "2023-08-09"
+---
+
+```{r}
+#Load required packages
+suppressWarnings(requiredpackages <- c('xgboost', 'caTools', 'dplyr', 'cvms', 'caret', 'readxl', 'zoo', 'readxl', 'DiagrammeRsvg', 'rsvg', 'stringr', 'Hmisc', 'corrplot'))
+
+install_load <- function(packages){
+     for (p in packages) {
+          if (p %in% rownames(installed.packages())) {
+               library(p, character.only=TRUE)
+          } else {
+               install.packages(p)
+               library(p,character.only = TRUE)
+          }
+     }
+}
+
+install_load(requiredpackages)
+rm(requiredpackages)
+```
+
+```{r Indicator Functions}
+#Create technical indicator functions
+
+#Price momentum MOM
+mymom <- function(price, n) {
+  mom <- rep(0, length(price))
+  N <- length(price)
+  for (i in (n + 1):(N-n)) {
+    mom[i] <- price[i] - price[i - n]
+  }
+  return(mom)
+}
+
+#Percentage Range PR
+mypr <- function (price,n){
+  pr <- c()
+  pr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- ((max(price[(i-n):i])))
+    min.temp <- ((min(price[(i-n):i])))
+    price.temp <- price[i]
+    numerator <- max.temp - price.temp
+    denominator <- max.temp - min.temp
+    pr[i] <- 100 * (numerator / denominator)
+  }
+  return(pr)
+}
+
+#Absolute True Range ATR
+myatr <- function (price,n){
+  atr <- c()
+  tr <- c()
+  atr[1:(n-1)] <- NA
+  tr[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    max.temp <- max(price[(i-n+1):i])
+    min.temp <- min(price[(i-n+1):i])
+    price.temp <- price[i]
+    A.temp <- max.temp - min.temp
+    B.temp <- abs(max.temp - price.temp)
+    C.temp <- abs(min.temp - price.temp)
+    TR.temp <- max(c(A.temp, B.temp, C.temp))
+    tr[i] <- TR.temp
+    atr[i] <- sum(tr[(i-n+1):i])
+  }
+  return(atr)
+}
+
+#Average Directional Movement Index ADX
+myadx <- function(price, n) {
+  adx <- numeric(length(price))
+  priceup <- numeric(length(price))
+  pricedown <- numeric(length(price))
+  adx[1:(n-1)] <- NA
+  priceup[1:(n-1)] <- NA
+  pricedown[1:(n-1)] <- NA
+  for (i in n:length(price)) {
+    if (!is.na(price[i]) && !is.na(price[(i-n+1)]) && price[i] - price[(i-n+1)] > 0) {
+      priceup[i] <- price[i] - price[(i-n+1)]
+    } else {
+      pricedown[i] <- price[i] - price[(i-n+1)]
+    }
+    positiveDM <- sum(priceup[(i-n+1):i], na.rm = TRUE)
+    negativeDM <- -sum(pricedown[(i-n+1):i], na.rm = TRUE)
+    tr <- sum(abs(diff(price[(i-n+1):(i+1)])), na.rm = TRUE)
+    plusDI <- (positiveDM / tr) * 100
+    minusDI <- (negativeDM / tr) * 100
+    adx[i] <- (abs(plusDI - minusDI) / (plusDI + minusDI)) * 100
+  }
+  return(adx)
+}
+
+#Relative Strength index RSI
+calculate_RSIs <- function(price, s) {
+  n <- length(price)
+  up <- numeric(n)
+  down <- numeric(n)
+  up[1] <- 0
+  down[1] <- 0
+  
+  for (i in 2:n) {
+    diff_price <- price[i] - price[i - 1]
+    if (!is.na(diff_price) && diff_price > 0) {
+      up[i] <- diff_price
+      down[i] <- 0
+    } else if (!is.na(diff_price) && diff_price < 0) {
+      up[i] <- 0
+      down[i] <- abs(diff_price)
+    } else {
+      up[i] <- 0
+      down[i] <- 0
+    }
+  }
+  
+  avg_up <- rollapply(up, width = s, FUN = mean, align = "right", fill = NA)
+  avg_down <- rollapply(down, width = s, FUN = mean, align = "right", fill = NA)
+  
+  RS <- avg_up / avg_down
+  RSI <- 100 - (100 / (1 + RS))
+  
+  return(as.vector(as.numeric(RSI)))
+}
+
+#Mean Absolute Convergence/Divergence MACD
+calculate_MACD <- function(price, a, b) {
+  ma_a <- stats::filter(price, rep(1/a, a), sides = 1)
+  ma_b <- stats::filter(price, rep(1/b, b), sides = 1)
+  macd <- ma_a - ma_b
+  
+  return(as.numeric(macd))
+}
+
+# Function to calculate Price percent Change Moving Average (PPCMA)
+calculate_PPCMA <- function(price, n) {
+  ppcma <- c()
+  ppcma[1:(n-1)] <- NA
+  for (i in n:length(price)){
+    pricei <- price[i]
+    pricelag48 <- price[((i-n)+1)]
+    ppc <- ((pricei - pricelag48) / pricelag48) * 100
+    ppcma[i] <- mean(ppc[(i-n+1):(i-1)])
+  }
+  return(ppcma)
+}
+
+
+# Function to calculate Mean Absolute Deviation (MAD)
+calculate_MADs <- function(prices, PPCMA) {
+  MADs <- (prices - PPCMA) / PPCMA
+  return(MADs)
+}
+```
+
+```{r Input Data from Excel}
+#Read in data
+suppressWarnings(df <- read_xlsx("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/Data/All Data - DAM.xlsx", col_types = "numeric")[,3:22])
+df <- data.frame(df)
+
+#Subset data for each market
+df.dam <- df[!is.na(df$Hour),]
+df.ida1 <- df[!is.na(df$PriceIDA1),]
+df.ida2 <- df[!is.na(df$PriceIDA2),]
+df.ida3 <- df[!is.na(df$PriceIDA3),]
+
+```
+
+```{r}
+#remove intraday features for dam prediction
+df.dam <- -subset(df.dam, select = -c(Temporary1, Temporary2, wdsp.Cork, wdsp.Donegal, wdsp.Dublin, wdsp.Galway, wdsp.Tipp, temp.Cork, temp.Donegal, temp.Dublin, temp.Galway, temp.Tipp))
+```
+
+```{r Indicators for DAM}
+#calculate the indicators for DAM
+price.dam <- df.dam$PriceDAM
+ppcma.dam <- calculate_PPCMA(price.dam, 24)
+mad.dam <- calculate_MADs(price.dam, ppcma.dam)
+mom.dam <- mymom(price.dam, 24)
+pr.dam <- mypr(price.dam, 24)
+atr.dam <- myatr(price.dam, 24)
+adx.dam <- myadx(price.dam, 24)
+rsi.dam <- calculate_RSIs(price.dam, 24)
+macd.dam <- calculate_MACD(price.dam, 12, 24)
+
+#add dam-specific TIs to DAM df
+df.dam <- as.data.frame(cbind(df.dam, ppcma.dam, mad.dam, mom.dam, pr.dam, atr.dam, adx.dam, rsi.dam, macd.dam))
+```
+
+```{r}
+#calculate a covariance matrix to see which wind variables to use - reduces overfitting
+windcor <- df.dam[1:nrow(df.dam),c("wdsp.Cork", "wdsp.Donegal", "wdsp.Dublin", "wdsp.Galway", "wdsp.Tipp", "wdsp.Average")] %>% 
+  as.matrix() %>% 
+  rcorr()
+
+windcormat <- windcor$r
+pvaluemat <- round(windcor$P,3)
+pvaluemat
+
+windcorplot <- corrplot(windcormat, method = "number", type = "upper", order = "alphabet", tl.col = "black", col = colorRampPalette(c("orange","black", "blue"))(100))
+```
+
+```{r}
+#same with temperatures
+tempcor <- df.dam[,c("temp.Cork","temp.Donegal", "temp.Dublin", "temp.Galway", "temp.Tipp", "temp.Average")] %>% 
+  as.matrix() %>% 
+  rcorr()
+
+tempcormat <- tempcor$r
+pvaluemat <- round(tempcor$P,3)
+pvaluemat
+
+tempcorplot <- corrplot(tempcormat, method = "number", type = "upper", order = "alphabet", tl.col = "black", col = colorRampPalette(c("blue", "brown"))(100))
+```
+
+```{r}
+#split known data into training and testing sets for training the DAM model
+sample.split.dam <- sample.split(Y = df.dam$PriceDAM, SplitRatio = 0.7)
+train.set.dam <- subset(x = df.dam, sample.split.dam == TRUE)
+test.set.dam <- subset(x = df.dam, sample.split.dam == FALSE)
+
+#split each of the training and testing subsets into target feature (DAM Price; y) and other features (indicators; X) 
+train.y.dam <- train.set.dam$PriceDAM
+train.x.dam <- train.set.dam %>% select(-PriceDAM)
+test.y.dam <- test.set.dam$PriceDAM
+test.x.dam <- test.set.dam %>%  select(-PriceDAM)
+
+#run if required only! imputes median value for NAs         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~            !
+#test.x.dam.median <- median(test.x.dam, na.rm = TRUE)
+#test.x.dam[is.na(test.x.dam)] <- test.y.dam.median
+#test.y.dam.median <- median(test.y.dam, na.rm = TRUE)
+#test.y.dam[is.na(test.y.dam)] <- test.y.dam.median
+
+#create XGB data structures for training and testing datasets
+xgb.train.dam <- xgb.DMatrix(data = as.matrix(train.x.dam), label = train.y.dam)
+xgb.test.dam <- xgb.DMatrix(data = as.matrix(test.x.dam), label = test.y.dam)
+```
+
+```{r}
+#create parameters for the dam model
+xgb.params.dam <- list(
+  booster = "gbtree", # the type of boost to use
+  eta = 0.1, # the learning rate or shrinkage
+  max_depth = 2, # the depth of the tree; too high makes overfitting more likely; range 0-inf
+  gamma = 500, # the minimum loss reduction needed before making another leaf node; higher number = more conservative
+  subsample = 0.6, # the amount of data to use for subsampling which occurs every iteration
+  colsample_bytree = 0.5, # this is the number of subsamples that happen for each tree; range 0-1
+  objective = "reg:squarederror", # learning goal of the model
+  eval_metric = "rmse",
+  eval_metric = "mae"
+)
+
+#create a watchlist of parameters to observe during training
+watch.dam <- list(train = xgb.train.dam, test = xgb.test.dam)
+```
+
+#hyperparameters to tune:
+# -eta
+# -max depth
+# -gamma for regularisatiom
+
+```{r}
+#now you can build the decision tree model
+xgb.model.dam <- xgb.train(
+  params = xgb.params.dam,
+  data = xgb.train.dam,
+  nrounds = 500,
+  watchlist = watch.dam,
+  verbose = 1
+)
+```
+
+```{r}
+#also build a linear boost model - ensure to mute eta as a parameter!!
+xgb.lmodel.dam <- xgb.train(
+  params = xgb.params.dam,
+  data = xgb.train.dam,
+  nrounds = 100,
+  watchlist = watch.dam,
+  verbose = 1
+)
+#purpose: ensure that linear model doesn't outperform xgb model; if it does then use glm
+```
+
+```{r}
+#plot training v testing error (RMSE) of model
+rmse.test.values.dam <- xgb.model.dam$evaluation_log$test_rmse
+rmse.train.values.dam <- xgb.model.dam$evaluation_log$train_rmse
+
+#create df for plotting
+rmse.curve.dam <- data.frame(Round = 1:500, ValidationError = rmse.test.values.dam, TrainingError = rmse.train.values.dam)
+
+#plot the df
+rmse.curve.dam.plot <- ggplot(rmse.curve.dam, aes(x = Round)) +
+  geom_line(aes(y = ValidationError, color="Validation Error")) +
+  geom_line(aes(y = TrainingError, color="Training Error")) +
+  labs(title = "RMSE for DAM: eta=0.1, maxdepth=2, gamma=500, subsample=0.6", x = "Number of Rounds", y = "RMSE", caption = str_wrap("No Intraday prices or volumes are included for DAM prediction. Does includes temp and wind speed data.", width=100)) +
+  scale_color_manual(values = c("Validation Error" = "red", "Training Error" = "blue")) +
+  theme_bw() +
+  theme(plot.caption = element_text(size=10, hjust=0.5)) +
+  ylim(1,150)
+
+print(rmse.curve.dam.plot)
+```
+
+```{r}
+#save RMSE graph
+ggsave("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Graphs/RMSE for DAM 14.png", plot = last_plot(), width = 12, height = 8, dpi = 1000)
+```
+
+```{r}
+#plot training v testing error (MAE) of model
+mae.test.values.dam <- xgb.model.dam$evaluation_log$test_mae
+mae.train.values.dam <- xgb.model.dam$evaluation_log$train_mae
+
+#create df for plotting
+mae.curve.dam <- data.frame(Round = 1:500, ValidationError = mae.test.values.dam, TrainingError = mae.train.values.dam)
+
+#plot the df
+mae.curve.dam.plot <- ggplot(mae.curve.dam, aes(x = Round)) +
+  geom_line(aes(y = ValidationError, color="Validation Error")) +
+  geom_line(aes(y = TrainingError, color="Training Error")) +
+  labs(title = "MAE for DAM: eta=0.1, maxdepth=2, gamma=500, subsample=0.6", x = "Number of Rounds", y = "MAE", caption = str_wrap("No Intraday prices or volumes are included for DAM prediction. Does includes temp and wind speed data.", width=100)) +
+  scale_color_manual(values = c("Validation Error" = "red", "Training Error" = "blue")) +
+  theme_bw() +
+  theme(plot.caption = element_text(size=10, hjust=0.5)) +
+  ylim(1,150)
+
+print(mae.curve.dam.plot)
+```
+
+```{r}
+#save MAE graph
+ggsave("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Graphs/MAE for DAM 14.png", plot = last_plot(), width = 12, height = 8, dpi = 1000)
+```
+
+```{r}
+#create parameters for the dam model
+xgb.params.dam <- list(
+  booster = "gbtree",
+  eta = 0.1,
+  max_depth = 2,
+  gamma = 0,
+  subsample = 0.6,
+  colsample_bytree = 1,
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eval_metric = "mae"
+)
+
+#train model with cross validation
+xgb.cv.model.dam <- xgb.cv(
+  params = xgb.params.dam,
+  data = xgb.train.dam,
+  nrounds = 500,
+  nfold = 10,
+  showsd = FALSE,
+  watchlist = watch.dam,
+  verbose = 1,
+  print_every_n = 50,
+  early_stopping_rounds = 10
+)
+
+xgb.cv.model.dam$evaluation_log
+
+#plot RMSE for cv model
+xgb.cv.model.dam.eval <- data.frame(Round = 1:500, Training = xgb.cv.model.dam$evaluation_log$train_rmse_mean, Testing = xgb.cv.model.dam$evaluation_log$test_rmse_mean)
+
+ggplot(xgb.cv.model.dam.eval, aes(x = Round)) +
+  geom_line(aes(y = Training, color="Training")) +
+  geom_line(aes(y = Testing, color="Testing")) +
+  labs(title = "mean RMSE for DAM: eta=0.1, maxdepth=2, gamma=500, subsample=0.6", x = "Number of Rounds", y = "RMSE", caption = "No Intraday prices or volumes are included for DAM prediction. Does includes temp and wind speed data.") +
+  scale_color_manual(values = c("Training" = "blue", "Testing" = "red")) +
+  theme_bw() +
+  theme(plot.caption = element_text(size=10, hjust=0.5)) +
+  ylim(1,150)
+```
+
+```{r}
+#save RMSE graph with cv folds
+ggsave("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Graphs/Mean RMSE cvFolds = 10.png", plot = last_plot(), width = 12, height = 8, dpi = 1000)
+```
+
+
+```{r}
+#plot MAE for cv model
+xgb.cv.model.dam.eval <- data.frame(Round = 1:500, Training = xgb.cv.model.dam$evaluation_log$train_mae_mean, Testing = xgb.cv.model.dam$evaluation_log$test_mae_mean)
+
+ggplot(xgb.cv.model.dam.eval, aes(x = Round)) +
+  geom_line(aes(y = Training, color="Training")) +
+  geom_line(aes(y = Testing, color="Testing")) +
+  labs(title = "mean MAE for DAM: eta=0.1, maxdepth=2, gamma=500, subsample=0.6", x = "Number of Rounds", y = "MAE", caption = "No Intraday prices or volumes are included for DAM prediction. Also includes temp and wind speed data.") +
+  scale_color_manual(values = c("Training" = "blue", "Testing" = "red")) +
+  theme_bw() +
+  ylim(1,150)
+```
+
+```{r}
+#save MAE graph with cv folds
+ggsave("//gopowerfp1/LCC Power/Kathy.Callan/Ex Ante Prediction/XGBoost Models/Graphs/Mean MAE cvFolds = 10.png", plot = last_plot(), width = 12, height = 8, dpi = 1000)
+```
+
+
+```{r}
+#remove unimportant features
+
+#create an 'importance matrix' of the features that are important
+xgb.dam.imp.mat <- xgb.importance(
+  feature_names = colnames(xgb.train.dam),
+  model = xgb.model.dam
+)
+xgb.plot.importance(xgb.dam.imp.mat)
+
+#create table from matrix
+xgb.dam.imp.tab <- as.data.frame(cbind(Feature = xgb.dam.imp.mat$Feature, Importance = xgb.dam.imp.mat$Importance))
+xgb.dam.most.imp.tab <- xgb.dam.imp.tab[xgb.dam.imp.tab$Importance>=0.01,]
+
+allfeatures <- xgb.dam.imp.mat$Feature
+colstokeep <- xgb.dam.most.imp.tab$Feature
+colstoremove <- allfeatures[!allfeatures %in% colstokeep]
+
+#sanity check
+any(colstoremove %in% colstokeep)
+```
+
+```{r}
+#reform the dataframe for dam prediction
+df.dam <- df.dam[, !(names(df.dam) %in% colstoremove)]
+
+###   RERUN TRAIN V TEST SPLITTING OF DATASETS    ###
+
+#split known data into training and testing sets for training the DAM model
+sample.split.dam <- sample.split(Y = df.dam$PriceDAM, SplitRatio = 0.7)
+train.set.dam <- subset(x = df.dam, sample.split.dam == TRUE)
+test.set.dam <- subset(x = df.dam, sample.split.dam == FALSE)
+
+#split each of the training and testing subsets into target feature (DAM Price; y) and other features (indicators; X) 
+train.y.dam <- train.set.dam$PriceDAM
+train.x.dam <- train.set.dam %>% select(-PriceDAM)
+test.y.dam <- test.set.dam$PriceDAM
+test.x.dam <- test.set.dam %>%  select(-PriceDAM)
+
+```
+
+```{r}
+#create new parameters for the updated dam model with only influential features
+xgb.params.dam <- list(
+  booster = "gbtree",
+  eta = 0.1,
+  max_depth = 2,
+  gamma = 0,
+  subsample = 0.6,
+  colsample_bytree = 1,
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eval_metric = "mae"
+)
+
+#now, cv and train a model based on the remaining sig features
+xgb.cv.model.dam <- xgb.cv(
+  params = xgb.params.dam,
+  data = xgb.train.dam,
+  nrounds = 500,
+  nfold = 10,
+  showsd = FALSE,
+  watchlist = watch.dam,
+  verbose = 1,
+  print_every_n = 50,
+  early_stopping_rounds = 5
+)
+
+bestiter <- xgb.cv.model.dam$evaluation_log$iter[min(xgb.cv.model.dam$evaluation_log$test_rmse_mean)]
+
+#retrain model using the best iteration from cv
+xgb.model.dam <- xgb.train(
+  params = xgb.params.dam,
+  data = xgb.train.dam,
+  nrounds = bestiter ,
+  watchlist = watch.dam,
+  verbose = 1
+)
+
+#create an 'importance matrix' of the features that are important for new cv model
+xgb.dam.imp.mat <- xgb.importance(
+  feature_names = colnames(xgb.model.dam),
+  model = xgb.model.dam
+)
+xgb.plot.importance(xgb.dam.imp.mat)
+
+```
+
+```{r}
+last_known_value <- tail(df.dam$PriceDAM, 1)
+predictions <- numeric(48)
+
+for (i in 1:48) {
+  input_data <- data.frame(last_value = last_known_value)  # Create a data frame with appropriate columns
+  prediction <- predict(xgb.model.dam, newdata = input_data)
+  predictions[i] <- prediction
+  last_known_value <- prediction
+}
+
+# 'predictions' now contains the predicted next 48 values
+print(predictions)
+```
+
+```{r}
+
+```
